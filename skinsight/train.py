@@ -5,6 +5,7 @@
     python -m skinsight.baseline --csv data/cosmetics.csv       # 同划分的词袋 + 逻辑回归对比
     python -m skinsight.train --csv data/cosmetics.csv --kb-feats            # 加知识库特征
     python -m skinsight.train --csv data/cosmetics.csv --task category       # 产品类别多分类
+    python -m skinsight.train --csv data/cosmetics.csv --init-ckpt checkpoints/pretrained.pt [--freeze-encoder]
     python -m skinsight.train --jsonl data/my_products.jsonl    # 自建数据
 """
 from __future__ import annotations
@@ -101,9 +102,13 @@ def main(argv=None):
     p.add_argument("--task", choices=["skin", "category"], default="skin",
                    help="skin：5 种肤质多标签；category：产品类别多分类（只支持 --csv）")
     p.add_argument("--kb-feats", action="store_true", help="把知识库的刺激/致痘等级和 tags 加到 token embedding 上")
+    p.add_argument("--init-ckpt", help="pretrain.py 的 checkpoint：沿用其词表和结构，加载 encoder 权重后微调")
+    p.add_argument("--freeze-encoder", action="store_true", help="配合 --init-ckpt：冻结 encoder，只训练注意力池化和分类头")
     p.add_argument("--out", help="默认 checkpoints/skin_type.pt（category 任务为 checkpoints/category.pt）")
     p.add_argument("--metrics-out", help="把 test 指标写成 JSON（便于和 baseline 对比）")
     args = p.parse_args(argv)
+    if args.freeze_encoder and not args.init_ckpt:
+        p.error("--freeze-encoder 需要 --init-ckpt")
     if args.task == "category" and not args.csv:
         p.error("--task category 需要 --csv（类别来自 CSV 的 Label 列）")
     args.out = args.out or ("checkpoints/category.pt" if args.task == "category" else "checkpoints/skin_type.pt")
@@ -125,7 +130,14 @@ def main(argv=None):
     train, val, test = split_samples(samples, seed=args.seed)
 
     # 知识库里的成分始终进词表，这样中文成分表在推理时也能对上
-    vocab = Vocab.build([t for t, _ in train], min_freq=args.min_freq, always=list(kb.items))
+    pre = None
+    if args.init_ckpt:
+        pre = torch.load(args.init_ckpt, map_location="cpu")
+        vocab = Vocab.from_dict(pre["vocab"])  # 预训练词表，已包含知识库成分
+        for k in ("d_model", "num_layers", "max_len", "dropout"):
+            setattr(args, {"num_layers": "layers"}.get(k, k), pre["config"][k])
+    else:
+        vocab = Vocab.build([t for t, _ in train], min_freq=args.min_freq, always=list(kb.items))
     print(f"样本 train/val/test = {len(train)}/{len(val)}/{len(test)}，词表 {len(vocab)}")
 
     mk = lambda s, sh: DataLoader(SkinDataset(s, vocab, args.max_len), batch_size=args.batch_size,
@@ -135,8 +147,14 @@ def main(argv=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     kb_feats = kb_feature_matrix(vocab, kb) if args.kb_feats else None
     model = SkinTypeNet(len(vocab), num_labels=len(label_names), d_model=args.d_model,
+                        nhead=pre["config"]["nhead"] if pre else 4,
                         num_layers=args.layers, max_len=args.max_len, dropout=args.dropout,
                         kb_feat_dim=len(kb_feats[0]) if kb_feats else 0)
+    if pre:
+        model.load_encoder(pre["model"])
+        if args.freeze_encoder:
+            for prm in model.encoder_parameters():
+                prm.requires_grad_(False)
     if kb_feats:
         model.kb_feats.copy_(torch.tensor(kb_feats))
     model = model.to(device)
@@ -147,7 +165,7 @@ def main(argv=None):
     else:
         pos = ys.sum(0).clamp(min=1)
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=((len(ys) - pos) / pos).to(device))
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    opt = torch.optim.AdamW([q for q in model.parameters() if q.requires_grad], lr=args.lr, weight_decay=1e-2)
 
     best, best_state, best_epoch = -1.0, None, 0
     for epoch in range(1, args.epochs + 1):

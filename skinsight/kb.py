@@ -11,8 +11,10 @@ from typing import Optional
 
 DEFAULT_KB = Path(__file__).parent / "data" / "ingredients.json"
 
-# 按逗号/顿号/分号/换行切分；数字之间的逗号（如 1,2-己二醇）不切
-SPLIT_RE = re.compile(r"(?<!\d),(?!\d)|[，、;；\n]+")
+# 英文逗号：只有两侧都是数字时不切（1,2-己二醇），"Polyquaternium-7, Parfum" 要切开
+COMMA_RE = r"(?<!\d),|,(?!\d)"
+# 按逗号/顿号/分号/换行切分
+SPLIT_RE = re.compile(COMMA_RE + r"|[，、;；\n]+")
 PAREN_RE = re.compile(r"[(（]([^)）]*)[)）]")
 
 

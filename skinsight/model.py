@@ -48,14 +48,50 @@ class SkinTypeNet(nn.Module):
         self.pool = AttentionPool(d_model)
         self.head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, num_labels))
 
-    def forward(self, ids: torch.Tensor):
-        # ids: [B, L]，0 为 padding；每行至少有一个非 padding token
+    # 预训练时学到、微调时迁移/冻结的部分；pool 和 head 属于分类头
+    ENCODER_PREFIXES = ("tok.", "pos.", "encoder.")
+
+    def encode(self, ids: torch.Tensor):
+        """ids: [B, L]，0 为 padding；返回逐位置表示 h [B, L, D] 和 pad_mask。"""
         pad_mask = ids.eq(0)
         positions = torch.arange(ids.size(1), device=ids.device).unsqueeze(0).expand_as(ids)
         e = self.tok(ids)
         if self.config["kb_feat_dim"]:
             e = e + self.kb_proj(self.kb_feats[ids])
         h = self.drop(e + self.pos(positions))
-        h = self.encoder(h, src_key_padding_mask=pad_mask)
+        return self.encoder(h, src_key_padding_mask=pad_mask), pad_mask
+
+    def forward(self, ids: torch.Tensor):
+        # 每行至少有一个非 padding token
+        h, pad_mask = self.encode(ids)
         pooled, attn = self.pool(h, pad_mask)
         return self.head(pooled), attn
+
+    def encoder_parameters(self):
+        return [p for n, p in self.named_parameters() if n.startswith(self.ENCODER_PREFIXES)]
+
+    def load_encoder(self, state: dict) -> None:
+        """从预训练 checkpoint 的 state_dict 里只加载 encoder 部分（词表必须一致）。"""
+        enc = {k: v for k, v in state.items() if k.startswith(self.ENCODER_PREFIXES)}
+        try:
+            missing, unexpected = self.load_state_dict(enc, strict=False)
+        except RuntimeError as e:  # 形状不一致（词表大小、d_model 不同）
+            raise ValueError(f"encoder 权重不匹配：{e}") from e
+        if unexpected or any(k.startswith(self.ENCODER_PREFIXES) for k in missing):
+            raise ValueError(f"encoder 权重不匹配：missing={missing} unexpected={unexpected}")
+
+
+class MaskedIngredientModel(nn.Module):
+    """预训练：SkinTypeNet 的 encoder + 输出层与 token embedding 共享权重的 MLM 头。"""
+
+    def __init__(self, **config):
+        super().__init__()
+        self.net = SkinTypeNet(**config)
+        d = self.net.config["d_model"]
+        self.transform = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.LayerNorm(d))
+        self.bias = nn.Parameter(torch.zeros(self.net.config["vocab_size"]))
+
+    def forward(self, ids: torch.Tensor):
+        h, _ = self.net.encode(ids)
+        # embedding 按 N(0,1) 初始化，内积量级 ~sqrt(d)，缩放后初始 loss 才接近 ln(V)
+        return self.transform(h) @ self.net.tok.weight.T * self.net.config["d_model"] ** -0.5 + self.bias  # [B, L, V]

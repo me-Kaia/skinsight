@@ -47,6 +47,7 @@ python -m skinsight analyze "Water, Glycerin, Fragrance, Coconut Oil" --ckpt che
 - **位置有意义**：INCI 成分表按含量从高到低排列（约 1% 以下可任意排序），所以「排第几位」作为位置 embedding 输入，而不是把成分当成无序集合。
 - **知识库对齐词表**：知识库收录的成分用统一 id 作为 token，中文和英文成分表推理时落在同一个 embedding 上。
 - **可选知识库特征**（`--kb-feats`）：刺激/致痘等级和 tags 投影后加到 token embedding 上；实测没有可靠提升，默认关闭，见 [Results](#results)。
+- **可选预训练**（`--init-ckpt`）：在 Open Beauty Facts 无标签成分表上做 masked ingredient modeling，再微调；对类别任务有帮助，对肤质任务没有可靠提升，见 [Pretraining](#pretraining)。
 - **类别不平衡**：`BCEWithLogitsLoss` 按正负样本比设置 `pos_weight`，按验证集 macro-F1 选最优 checkpoint。
 
 ## 数据
@@ -55,6 +56,7 @@ python -m skinsight analyze "Water, Glycerin, Fragrance, Coconut Oil" --ckpt che
 |---|---|
 | 合成数据 `--synthetic` | 只用于跑通流程和测试，**不代表真实规律** |
 | [Kaggle: Cosmetics datasets](https://www.kaggle.com/datasets/kingabzpro/cosmetics-datasets) | 1,472 条丝芙兰产品，带成分表和 5 种肤质适配标签，下载后 `--csv data/cosmetics.csv`（CSV 不入库）；清洗后可用 853 条，见 [Results](#results) |
+| [Open Beauty Facts](https://world.openbeautyfacts.org/)（ODbL） | 1.4 万条无标签成分表，只用于自监督预训练，放在 `data/openbeautyfacts/`（不入库），见 [Pretraining](#pretraining) |
 | 自建 JSONL `--jsonl` | 每行 `{"ingredients": "水, 甘油, ...", "labels": {"Dry": 1, "Sensitive": 1}}` |
 
 知识库在 `skinsight/data/ingredients.json`，目前收录 64 个常见成分，欢迎 PR 补充。
@@ -67,17 +69,21 @@ skinsight/
 ├── kb.py                   成分表解析、别名/括号/模糊匹配、规则提示
 ├── conflicts.py            叠用冲突规则引擎
 ├── data_utils.py           token 化、词表、数据集加载、合成数据
-├── model.py                SkinTypeNet（PyTorch）
-├── train.py                训练脚本
+├── model.py                SkinTypeNet、MaskedIngredientModel（PyTorch）
+├── train.py                训练脚本（--init-ckpt 加载预训练 encoder）
+├── pretrain_data.py        从 Open Beauty Facts 导出准备预训练语料
+├── pretrain.py             masked ingredient modeling 自监督预训练
 ├── baseline.py             词袋 + 逻辑回归 baseline（同划分、同指标）
 ├── predict.py              推理 + 注意力解释
 └── cli.py                  命令行入口
-tests/                      单元测试：python -m unittest
+tests/                      单元测试：python -m unittest discover -s tests
 ```
 
 ## Results
 
-在 Kaggle Cosmetics datasets 上的结果。**结论先说：在这份数据上，SkinTypeNet 和词袋逻辑回归都没有超过「全部预测为适合」的平凡基线（macro-F1）；按 ROC-AUC 看，逻辑回归学到了一点信号，SkinTypeNet 更弱。** 主要原因在数据本身，见下。
+在 Kaggle Cosmetics datasets 上的结果。**结论先说：在这份数据上，SkinTypeNet 和词袋逻辑回归都没有超过「全部预测为适合」的平凡基线（macro-F1）；按 ROC-AUC 看，逻辑回归学到了一点信号，SkinTypeNet 更弱，预训练也没有改变这个排序（见 [Pretraining](#pretraining)）。** 主要原因在数据本身，见下。
+
+> **切分 bug 修复**：早期版本把英文逗号的切分规则写成了「逗号任意一侧是数字就不切」，本意是保护 `1,2-Hexanediol`，结果 `Polyquaternium-7, Parfum`、`Steareth-10,Dimethicone` 这类成分也被粘成一个 token（约 4% 的 token、66% 的丝芙兰产品受影响）。现在只有逗号**两侧都是数字**时才不切，并补了测试。下面所有数字都是修复后从头重跑的结果（包括预训练），和之前提交里的数字不可比。
 
 ### 数据
 
@@ -99,31 +105,31 @@ tests/                      单元测试：python -m unittest
 
 - 有标注的产品里 **67% 被标为 5 种肤质全部适合**，负样本很少，这是 F1 难以超过平凡基线的根本原因。
 - 全 0 行约占原始数据 1/3，且在 6 个品类里比例相近，更像漏标而非「不适合任何肤质」。保留它们时，任务很大程度上变成「这个产品有没有被标注」，和成分关系不大。
-- 知识库（64 个成分）在 token 级别识别了 **27.5%** 的成分，98.8% 的产品至少命中 1 个；没识别的成分以原文 token 进入词表（`raw:caprylyl glycol` 等），模型同样能用。最常见的未收录成分：辛甘醇、生育酚乙酸酯、柠檬酸、山梨酸钾、氢氧化钠。
+- 知识库（64 个成分）在 token 级别识别了 **27.5%** 的成分，98.9% 的产品至少命中 1 个；没识别的成分以原文 token 进入词表（`raw:caprylyl glycol` 等），模型同样能用。最常见的未收录成分：辛甘醇、柠檬酸、生育酚乙酸酯、山梨酸钾、氢氧化钠。
 
 `load_cosmetics_csv` 的清洗（`clean_ingredients`）：去掉占位符和纯营销文案（营销文案后面接了真实成分表的保留成分表部分）、"...Ingredients:" 前缀、"Please be aware..." 等免责声明、`*Organic.` 类脚注、浓度（含 `5.0%Water` 这种粘连）、`(and)` / `May Contain:` 分隔；然后丢弃全 0 标签行并按成分表去重。
 
 ### 指标
 
-同一 `split_samples` 划分，5 个随机种子（1–5）取平均，test 集。阈值 0.5 的 F1 + 与阈值无关的 ROC-AUC（平凡基线的 AUC 恒为 0.5）。
+同一 `split_samples` 划分，5 个随机种子（1–5）取平均，test 集。阈值 0.5 的 F1 + 与阈值无关的 ROC-AUC（平凡基线的 AUC 恒为 0.5）。默认设置下有一个种子的 test 集里 Combination 没有负样本，该标签的 AUC 只在 4 个种子上平均。
 
 **默认设置（丢弃全 0 行，853 条）**
 
 | 方法 | Combination | Dry | Normal | Oily | Sensitive | macro-F1 | macro-AUC |
 |---|---|---|---|---|---|---|---|
 | 全部预测为适合 | 0.988 | 0.957 | 0.989 | 0.943 | 0.845 | **0.944 ± 0.002** | 0.500 |
-| 词袋 + 逻辑回归 | 0.984 | 0.927 | 0.984 | 0.898 | 0.799 | 0.919 ± 0.004 | **0.666 ± 0.045** |
-| SkinTypeNet | 0.978 | 0.924 | 0.973 | 0.910 | 0.814 | 0.920 ± 0.005 | 0.560 ± 0.072 |
+| 词袋 + 逻辑回归 | 0.983 | 0.921 | 0.984 | 0.898 | 0.807 | 0.919 ± 0.007 | **0.679 ± 0.061** |
+| SkinTypeNet | 0.979 | 0.935 | 0.976 | 0.905 | 0.796 | 0.918 ± 0.008 | 0.619 ± 0.038 |
 
 **保留全 0 行（1,213 条）**
 
 | 方法 | Combination | Dry | Normal | Oily | Sensitive | macro-F1 | macro-AUC |
 |---|---|---|---|---|---|---|---|
 | 全部预测为适合 | 0.805 | 0.774 | 0.800 | 0.763 | 0.708 | **0.770 ± 0.029** | 0.500 |
-| 词袋 + 逻辑回归 | 0.764 | 0.738 | 0.764 | 0.710 | 0.651 | 0.726 ± 0.029 | **0.703 ± 0.026** |
-| SkinTypeNet | 0.787 | 0.749 | 0.775 | 0.721 | 0.674 | 0.741 ± 0.019 | 0.650 ± 0.042 |
+| 词袋 + 逻辑回归 | 0.774 | 0.745 | 0.768 | 0.712 | 0.670 | 0.734 ± 0.036 | **0.702 ± 0.032** |
+| SkinTypeNet | 0.776 | 0.743 | 0.763 | 0.725 | 0.684 | 0.738 ± 0.051 | 0.641 ± 0.040 |
 
-- SkinTypeNet：`--epochs 40 --lr 3e-4 --d-model 128`，2 层，按验证集 macro-F1 选 epoch。在种子 42 上试了 lr ∈ {1e-3, 3e-4} × d_model ∈ {32, 64, 128}；验证集最高的一组（lr=1e-3, d=64）最优 epoch 是第 1 轮，实际上退化成了「全预测为正」，所以没选它。
+- SkinTypeNet：`--epochs 40 --lr 1e-3 --d-model 128`，2 层，按验证集 macro-F1 选 epoch。在种子 42 上试了 lr ∈ {1e-3, 3e-4} × d_model ∈ {32, 64, 128}（30 epoch），选验证集最高的一组；最优 epoch 为第 1 轮的配置（实际上退化成「全预测为正」）不参与选择，这一轮没有出现。
 - 逻辑回归：二值词袋（同一套 token 和 min_freq=2），每个标签一个 `class_weight="balanced"` 的模型，C 在验证集上从 {0.01 … 3} 里选。
 - test 集只有 85 / 121 条，± 是 5 个种子间的标准差，差距在 0.01 左右的结论都不可靠。
 - 用 `pos_weight` / `class_weight` 平衡类别会把一部分本该是正的预测压成负，在正样本占九成的数据上这对 F1 是净亏的；这也是两者 F1 都低于平凡基线的直接原因。
@@ -132,30 +138,30 @@ tests/                      单元测试：python -m unittest
 
 ```bash
 python -m skinsight.baseline --csv data/cosmetics.csv --seed 1 --metrics-out runs/lr_1.json
-python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 3e-4 --d-model 128 --metrics-out runs/m_1.json
+python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 1e-3 --d-model 128 --metrics-out runs/m_1.json
 ```
 
 ### 预测示例
 
-用默认设置、种子 42 训练的 checkpoint（test macro-F1 0.926），下面两个产品都在它的 test 集里，两个都有判错：
+用默认设置、种子 42 训练的 checkpoint（test macro-F1 0.925），下面两个产品都在它的 test 集里：
 
 **LANEIGE Water Bank Moisture Cream**（面霜）
 
 | | 混合肌 | 干皮 | 中性肌 | 油皮 | 敏感肌 |
 |---|---|---|---|---|---|
 | 标签 | 0 | 1 | 1 | 0 | 1 |
-| 预测 | 0.98 | 1.00 | 0.99 | 0.85 | 1.00 |
+| 预测 | 0.99 | 0.99 | 1.00 | 0.88 | 1.00 |
 
-注意力最高：生育酚 (0.11)、Hydrogenated Polyisobutene (0.06)、Acetyl Glucosamine (0.06)。注意力很分散，模型没能识别出「偏滋润、不适合油皮」，混合肌和油皮都判错了。
+注意力最高：Polyisobutene (0.12)、Chenopodium Quinoa Seed Extract (0.11)、聚二甲基硅氧烷 (0.10)。注意力落在几个油脂/成膜成分上，但模型没有因此判定「不适合油皮」，混合肌和油皮都判错了。
 
-**CAUDALIE Beauty Elixir**（喷雾）
+**OLEHENRIKSEN Goodnight Glow Retin-ALT Sleeping Crème**（晚霜）
 
 | | 混合肌 | 干皮 | 中性肌 | 油皮 | 敏感肌 |
 |---|---|---|---|---|---|
-| 标签 | 1 | 0 | 1 | 1 | 1 |
-| 预测 | 1.00 | 0.98 | 0.99 | 0.99 | 0.16 |
+| 标签 | 1 | 1 | 1 | 1 | 0 |
+| 预测 | 0.92 | 1.00 | 0.99 | 0.67 | 0.03 |
 
-注意力最高：丁香酚 Eugenol (0.26)、迷迭香叶油 (0.12)、变性乙醇 (0.11)。模型因为香料致敏原和排第 2 位的酒精判它不适合敏感肌，这个理由本身说得通，但和数据标签（标为适合敏感肌）不一致；干皮也判错了。
+5 个标签全部判对，包括少见的负标签「不适合敏感肌」。注意力最高：Dicaprylyl Carbonate (0.18)、Sodium Phytate (0.13)、Silybum Marianum Fruit Extract (0.09)，看不出和「敏感肌」有什么直接关系，所以这次判对不一定是因为模型理解了配方，注意力权重只能当作参考。
 
 ### 知识库特征（`--kb-feats`）
 
@@ -163,12 +169,12 @@ python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 3e-
 
 | 设置 | 方法 | Combination | Dry | Normal | Oily | Sensitive | macro-F1 | macro-AUC |
 |---|---|---|---|---|---|---|---|---|
-| 丢弃全 0 行 | SkinTypeNet | 0.978 | 0.924 | 0.973 | 0.910 | 0.814 | 0.920 ± 0.005 | 0.560 ± 0.072 |
-| 丢弃全 0 行 | + 知识库特征 | 0.981 | 0.918 | 0.981 | 0.919 | 0.807 | 0.921 ± 0.012 | 0.580 ± 0.092 |
-| 保留全 0 行 | SkinTypeNet | 0.787 | 0.749 | 0.775 | 0.721 | 0.674 | 0.741 ± 0.019 | 0.650 ± 0.042 |
-| 保留全 0 行 | + 知识库特征 | 0.791 | 0.750 | 0.778 | 0.731 | 0.679 | 0.746 ± 0.018 | 0.597 ± 0.057 |
+| 丢弃全 0 行 | SkinTypeNet | 0.979 | 0.935 | 0.976 | 0.905 | 0.796 | 0.918 ± 0.008 | 0.619 ± 0.038 |
+| 丢弃全 0 行 | + 知识库特征 | 0.986 | 0.935 | 0.983 | 0.922 | 0.821 | 0.929 ± 0.005 | 0.591 ± 0.054 |
+| 保留全 0 行 | SkinTypeNet | 0.776 | 0.743 | 0.763 | 0.725 | 0.684 | 0.738 ± 0.051 | 0.641 ± 0.040 |
+| 保留全 0 行 | + 知识库特征 | 0.764 | 0.727 | 0.756 | 0.719 | 0.679 | 0.729 ± 0.031 | 0.635 ± 0.029 |
 
-**没有可靠的提升。** macro-F1 的变化都在 0.005 以内；macro-AUC 在默认设置下 5 个种子里 4 升 1 降（均值 +0.02，标准差 0.09，远大于差值），保留全 0 行时 4 降 1 平（均值 −0.05）。仍然不如词袋逻辑回归（AUC 0.666 / 0.703）。原因推测：
+**没有可靠的提升。** 丢弃全 0 行时 macro-F1 +0.011，但 macro-AUC −0.028（5 个种子里 2 升 3 降），说明 F1 的上升主要是预测更偏向「适合」，而不是排序更准；保留全 0 行时两个指标都略降（AUC 3 升 2 降）。仍然不如词袋逻辑回归（AUC 0.679 / 0.702）。原因推测：
 
 - 知识库成分本来就各有独立的 token embedding，这 15 维是 token id 的固定函数，对见过的成分不提供新信息，只能作为「相似成分共享方向」的先验；
 - 只有 27.5% 的 token 被识别，13 个 tag 里多数只覆盖 1~3 个成分；
@@ -178,25 +184,113 @@ python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 3e-
 
 ### 产品类别分类（`--task category`）
 
-用 CSV 的 `Label` 列（Cleanser / Eye cream / Face Mask / Moisturizer / Sun protect / Treatment）做 6 分类。这个任务不用肤质标签，全 0 行也保留，清洗和去重同上，共 1,213 条（971/121/121）。同成分表出现在多个类别时只保留第一条。SkinTypeNet 换成 softmax + 交叉熵（6 类 170~298 条，较均衡，不加权），在种子 42 的验证集上从 lr ∈ {1e-3, 3e-4} × d_model ∈ {64, 128} 选了 lr=3e-4、d_model=64，40 epoch；逻辑回归是多项 LR，`class_weight="balanced"`，C 按验证集 macro-F1 选。5 个种子平均：
+用 CSV 的 `Label` 列（Cleanser / Eye cream / Face Mask / Moisturizer / Sun protect / Treatment）做 6 分类。这个任务不用肤质标签，全 0 行也保留，清洗和去重同上，共 1,213 条（971/121/121）。同成分表出现在多个类别时只保留第一条。SkinTypeNet 换成 softmax + 交叉熵（6 类 170~298 条，较均衡，不加权），d_model 固定为 128（与预训练模型一致，保证和 [Pretraining](#pretraining) 的对比公平），在种子 42 的验证集上从 lr ∈ {1e-3, 3e-4} 选了 3e-4，40 epoch；逻辑回归是多项 LR，`class_weight="balanced"`，C 按验证集 macro-F1 选。5 个种子平均：
 
 | 方法 | Cleanser | Eye cream | Face Mask | Moisturizer | Sun protect | Treatment | accuracy | macro-F1 |
 |---|---|---|---|---|---|---|---|---|
 | 全部预测为训练集最多的类 | — | — | — | — | — | — | 0.167 ± 0.016 | 0.048 ± 0.004 |
-| 词袋 + 逻辑回归 | 0.644 | 0.506 | 0.492 | 0.367 | 0.662 | 0.351 | **0.506 ± 0.029** | **0.504 ± 0.033** |
-| SkinTypeNet | 0.428 | 0.371 | 0.493 | 0.388 | 0.477 | 0.266 | 0.412 ± 0.045 | 0.404 ± 0.052 |
-| SkinTypeNet + 知识库特征 | 0.512 | 0.275 | 0.435 | 0.307 | 0.424 | 0.259 | 0.369 ± 0.084 | 0.369 ± 0.081 |
+| 词袋 + 逻辑回归 | 0.642 | 0.478 | 0.511 | 0.394 | 0.644 | 0.416 | **0.509 ± 0.031** | **0.514 ± 0.035** |
+| SkinTypeNet | 0.452 | 0.356 | 0.467 | 0.382 | 0.520 | 0.223 | 0.405 ± 0.041 | 0.400 ± 0.046 |
+| SkinTypeNet + 知识库特征 | 0.526 | 0.359 | 0.503 | 0.343 | 0.666 | 0.226 | 0.438 ± 0.031 | 0.437 ± 0.030 |
 
 - 成分表里**确实有类别信号**（两个模型都远高于平凡基线），这和肤质任务不同，说明前面肤质结果差主要是标签问题，而不只是模型问题。
-- 但 SkinTypeNet 比逻辑回归低约 0.10，加知识库特征后更低、方差更大。1 千条左右的数据量对 2 层 Transformer 偏少，词袋线性模型更稳。
+- 但 SkinTypeNet 比逻辑回归低约 0.11。知识库特征在这个任务上 +0.037（5 个种子 3 升 2 降），主要来自防晒（防晒剂 tag）和洁面，但差值小于种子间标准差，不算可靠。1 千条左右的数据量对 2 层 Transformer 偏少，词袋线性模型更稳。
 - 逻辑回归里防晒和洁面最好认，面霜和 Treatment（精华等）最难。推测前两者分别有防晒剂、表面活性剂这类标志性成分，后两者成分重叠较大（未逐一验证）。
 
 复现：
 
 ```bash
 python -m skinsight.baseline --csv data/cosmetics.csv --task category --seed 1
-python -m skinsight.train --csv data/cosmetics.csv --task category --seed 1 --epochs 40 --lr 3e-4 --d-model 64
-python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 3e-4 --d-model 128 --kb-feats
+python -m skinsight.train --csv data/cosmetics.csv --task category --seed 1 --epochs 40 --lr 3e-4 --d-model 128
+python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 1e-3 --d-model 128 --kb-feats
+```
+
+## Pretraining
+
+丝芙兰数据只有 1 千条左右，于是试了在更大的**无标签**成分表语料上做自监督预训练，再微调到上面两个任务。
+
+### 语料：Open Beauty Facts
+
+预训练语料来自 [Open Beauty Facts](https://world.openbeautyfacts.org/)（英文站的 CSV 导出 `en.openbeautyfacts.org.products.csv.gz`），数据以 [Open Database License (ODbL)](https://opendatacommons.org/licenses/odbl/1-0/) 授权，© Open Beauty Facts contributors。原始数据和处理后的语料都放在 `data/openbeautyfacts/` 下，**不入库**，需要自行下载。
+
+| | 条数 |
+|---|---|
+| 导出中的产品 | 64,237 |
+| 有成分表文本的 | 17,626 |
+| − 清洗后不是成分表（同 `clean_ingredients`） | 7 |
+| − 不足 5 个成分 | 2,289 |
+| − 成分表完全相同的重复 | 686 |
+| − 与 cosmetics.csv 某条成分表完全相同（防止下游 test 泄漏） | 5 |
+| **语料** | **14,639**（预训练 train/val = 13,908/731） |
+
+语料平均 20.6 个成分（丝芙兰 36.3），知识库识别率 26.7%；按出现次数计，丝芙兰成分表里 88.2% 的成分在语料中也出现过。
+
+### 方法
+
+- **任务**：masked ingredient modeling。每条成分表随机选 15% 的成分（pad/unk 不选，每条至少 1 个）作为目标，其中 80% 换成 `[MASK]`、10% 换成随机成分、10% 不变，用 encoder 输出预测原成分。
+- **模型**：和下游完全同构的 SkinTypeNet encoder（token + 排序位置 embedding、2 层 Transformer，d_model=128），输出层与 token embedding 共享权重（logits 乘 d^-0.5，否则 N(0,1) 初始化的 embedding 让初始 loss 高达 17）。
+- **词表**：预训练 train 部分出现 ≥ 2 次的成分 ∪ cosmetics.csv 成分表（**只用文本、不用任何标签**）中出现 ≥ 2 次的成分 ∪ 知识库，共 9,106 个；MLM 本身只在 OBF 语料上做，不看丝芙兰成分表。预训练 train 集 unk 比例 14.9%。
+- **训练**：AdamW lr 1e-3，5% warmup + 线性衰减，batch 64，CPU 上限 55 分钟（39 个 epoch，55.2 分钟后停止）。
+
+### 预训练指标
+
+预训练 val 集（731 条，1,869 个被遮成分，固定遮罩种子）：
+
+| | top-1 | top-5 |
+|---|---|---|
+| 频率基线（总猜训练集最常见的成分） | 0.044 | 0.154 |
+| 预训练模型 | **0.303** | **0.455** |
+
+模型确实学到了成分表的共现结构，远好于频率基线。
+
+### 微调对比
+
+下游划分、5 个种子、test 集全部与 [Results](#results) 相同；「从头训练」和逻辑回归就是上面表里的同一批结果。预训练模型的两种用法：
+
+- **pre + 全量微调**：加载 encoder，所有参数都训练；lr 在种子 42 验证集上从 {1e-4, 3e-4} 选了 3e-4。
+- **pre + 冻结 encoder**：只训练注意力池化和分类头；lr 从 {3e-4, 1e-3} 选了 1e-3（肤质任务 3e-4 最优 epoch 是第 1 轮，退化，不参与选择）。
+
+肤质任务看 macro-AUC，类别任务看 macro-F1：
+
+| 方法 | 肤质 AUC（丢弃全 0 行） | 肤质 AUC（保留全 0 行） | 类别 macro-F1 |
+|---|---|---|---|
+| 平凡基线 | 0.500 | 0.500 | 0.048 ± 0.004 |
+| 词袋 + 逻辑回归 | **0.679 ± 0.061** | **0.702 ± 0.032** | **0.514 ± 0.035** |
+| SkinTypeNet 从头训练 | 0.619 ± 0.038 | 0.641 ± 0.040 | 0.400 ± 0.046 |
+| pre + 全量微调 | 0.586 ± 0.042 | 0.669 ± 0.034 | 0.468 ± 0.059 |
+| pre + 冻结 encoder | 0.630 ± 0.057 | 0.633 ± 0.026 | 0.413 ± 0.075 |
+
+（对应的 macro-F1：肤质丢弃全 0 行时 0.911 / 0.821，保留全 0 行时 0.746 / 0.711；类别 accuracy 0.468 / 0.425。冻结 encoder 在丢弃全 0 行时 F1 只有 0.821，是因为它预测出了更多「不适合」，在正样本占九成的数据上被 F1 惩罚。）
+
+- **类别任务：预训练有帮助。** 全量微调比从头训练高 0.068，**5 个种子全部提升**；但仍比逻辑回归低 0.046。
+- **肤质任务：没有可靠的结论。** 保留全 0 行时全量微调 +0.028（3 升 2 降），丢弃全 0 行时反而 −0.033（1 升 4 降）；冻结 encoder 在两个设置下和从头训练相差都在 0.01 左右。这些差值都小于种子间标准差（0.03~0.06）。肤质标签本身的信号太弱（见 [数据](#数据)），更好的成分表示也救不回来。
+- **逻辑回归在三列里仍然都是最好的。** 1.4 万条无标签语料让 Transformer 在类别任务上追近了一半差距，但不足以超过词袋线性模型。
+
+### 最近邻检查
+
+对出现 ≥ 20 次的成分，在 token embedding 上找余弦最近邻：
+
+- **直接用 embedding**：最近邻基本没有规律（例如 Glycerin → benzophenone-3、Propylene Glycol、microcrystalline wax）。原因是 embedding 是 N(0,1) 初始化、9 千维词表，训练只让它相对初始值移动了一小部分，余弦相似度主要还是初始噪声。
+- **减去初始值（W − W0，再中心化）**：只看训练学到的部分，出现了一些合理的簇：
+  - Parfum → perfume、parfum/fragrance 的其他写法、薰衣草油、甜橙果皮油、苯乙醇（香精和精油/香料成分）；
+  - Zinc Oxide → Titanium Dioxide、talc、kaolin（矿物粉体/物理防晒）；
+  - Dimethicone → cyclopentasiloxane、Carbomer、glycol stearate（硅油和质地成分）。
+- **活性成分没有聚在一起**：Niacinamide、Retinol、Salicylic Acid 的最近邻都是不相关的成分（Retinol 在语料里只出现 37 次）。也就是说预训练学到的主要是「香精类 / 粉体类 / 基质类」这种配方结构，而不是功效，这和它对类别任务有帮助、对肤质任务帮助不大的结果是一致的。
+
+### 复现
+
+```bash
+# 1. 下载 Open Beauty Facts 导出（约 18 MB），放到 data/openbeautyfacts/
+# 2. 准备语料（去掉与 cosmetics.csv 完全相同的成分表）
+python -m skinsight.pretrain_data --obf data/openbeautyfacts/en.openbeautyfacts.org.products.csv.gz \
+    --exclude-csv data/cosmetics.csv --out data/openbeautyfacts/pretrain.jsonl
+# 3. 预训练（CPU 约 55 分钟）
+python -m skinsight.pretrain --corpus data/openbeautyfacts/pretrain.jsonl --cosmetics-csv data/cosmetics.csv \
+    --epochs 40 --time-limit 55 --out checkpoints/pretrained.pt
+# 4. 微调：全量 / 冻结 encoder（d_model 等结构参数取自预训练 checkpoint）
+python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 3e-4 --init-ckpt checkpoints/pretrained.pt
+python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 1e-3 --init-ckpt checkpoints/pretrained.pt --freeze-encoder
+python -m skinsight.train --csv data/cosmetics.csv --task category --seed 1 --epochs 40 --lr 3e-4 --init-ckpt checkpoints/pretrained.pt
 ```
 
 ## Roadmap

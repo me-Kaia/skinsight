@@ -23,6 +23,15 @@ class TestKB(unittest.TestCase):
         items = kb.parse("水, 1,2-己二醇, 甘油")
         self.assertEqual([i.ingredient.id for i in items], ["water", "hexanediol", "glycerin"])
 
+    def test_split_comma_rule(self):
+        raw = lambda t: [i.raw for i in kb.parse(t)]
+        self.assertEqual(raw("1,2-hexanediol"), ["1,2-hexanediol"])  # 两侧都是数字：不切
+        self.assertEqual(raw("polyquaternium-7, parfum"), ["polyquaternium-7", "parfum"])
+        self.assertEqual(raw("Steareth-10,Dimethicone"), ["Steareth-10", "Dimethicone"])
+        self.assertEqual(raw("Water,1,2-Hexanediol"), ["Water", "1,2-Hexanediol"])
+        self.assertEqual(clean_ingredients("Polyquaternium-7, Parfum, 1,2-Hexanediol"),
+                         "Polyquaternium-7, Parfum, 1,2-Hexanediol")
+
     def test_chinese_and_inci_map_to_same_id(self):
         self.assertEqual(to_tokens("烟酰胺，透明质酸钠", kb), to_tokens("Niacinamide, Sodium Hyaluronate", kb))
 
@@ -137,6 +146,39 @@ class TestModel(unittest.TestCase):
         self.assertTrue(torch.equal(m2.kb_feats, m.kb_feats))
         old = SkinTypeNet(vocab_size=10, max_len=16).config; old.pop("kb_feat_dim")
         SkinTypeNet(**old)
+
+
+
+@unittest.skipIf(torch is None, "未安装 torch")
+class TestPretrain(unittest.TestCase):
+    def test_mask_tokens(self):
+        from skinsight.pretrain import IGNORE, mask_tokens
+        x = torch.tensor([[5, 6, 7, 8, 0, 0], [1, 9, 0, 0, 0, 0]])  # 第 2 行只有 1 个可遮（1 是 unk）
+        inp, tgt = mask_tokens(x, mask_id=2, vocab_size=20, gen=torch.Generator().manual_seed(0))
+        m = tgt != IGNORE
+        self.assertTrue(m.any(1).all())                       # 每行至少遮 1 个
+        self.assertFalse(m[x <= 2].any())                     # pad / unk 不作为目标
+        self.assertTrue(torch.equal(tgt[m], x[m]))            # 目标是原 token
+        self.assertTrue(torch.equal(inp[~m], x[~m]))          # 未选中的位置不变
+
+    def test_mlm_and_encoder_transfer(self):
+        from skinsight.model import MaskedIngredientModel, SkinTypeNet
+        mlm = MaskedIngredientModel(vocab_size=30, d_model=16, max_len=8)
+        self.assertEqual(tuple(mlm(torch.tensor([[3, 4, 5]])).shape), (1, 3, 30))
+        net = SkinTypeNet(vocab_size=30, num_labels=6, d_model=16, max_len=8)
+        net.load_encoder(mlm.net.state_dict())
+        self.assertTrue(torch.equal(net.tok.weight, mlm.net.tok.weight))
+        self.assertFalse(torch.equal(net.head[1].weight[:5], mlm.net.head[1].weight[:5]))  # 分类头不迁移
+        with self.assertRaises(ValueError):
+            SkinTypeNet(vocab_size=31, d_model=16, max_len=8).load_encoder(mlm.net.state_dict())
+
+    def test_build_vocab(self):
+        from skinsight.data_utils import MASK
+        from skinsight.pretrain import build_vocab
+        v = build_vocab([["raw:a", "raw:a", "raw:b"]], [["raw:c", "raw:c"]], kb, min_freq=2)
+        self.assertEqual(v.itos[:3], ["<pad>", "<unk>", MASK])
+        self.assertIn("raw:a", v.stoi); self.assertIn("raw:c", v.stoi); self.assertNotIn("raw:b", v.stoi)
+        self.assertIn("niacinamide", v.stoi)
 
 
 if __name__ == "__main__":

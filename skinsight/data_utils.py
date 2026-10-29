@@ -8,12 +8,12 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from .kb import KnowledgeBase, normalize
+from .kb import COMMA_RE, KnowledgeBase, normalize
 
 LABELS = ["Combination", "Dry", "Normal", "Oily", "Sensitive"]
 LABELS_ZH = ["混合肌", "干皮", "中性肌", "油皮", "敏感肌"]
 CATEGORIES = ["Cleanser", "Eye cream", "Face Mask", "Moisturizer", "Sun protect", "Treatment"]  # CSV 的 Label 列
-PAD, UNK = "<pad>", "<unk>"
+PAD, UNK, MASK = "<pad>", "<unk>", "<mask>"  # MASK 只在预训练词表里出现
 
 
 def to_tokens(text: str, kb: KnowledgeBase) -> list[str]:
@@ -81,7 +81,7 @@ def clean_ingredients(text: str) -> str | None:
     text = re.sub(r"(?i)\(and\)|\bmay contain\s*:?|\[?\+/-\]?", ",", text)
     text = re.sub(r"\.\s+(?=[A-Z*])", ", ", text)  # 句号分句 -> 分隔符，脚注单独成项
     text = re.sub(r"\s+(?=\*+\s*[A-Za-z])", ", ", text)  # "Phenoxyethanol * essential oil"
-    parts = [p.strip() for p in re.split(r"(?<!\d),(?!\d)", text)]  # 同 kb.SPLIT_RE，不拆 1,2-己二醇
+    parts = [p.strip() for p in re.split(COMMA_RE, text)]  # 与 kb.SPLIT_RE 相同的逗号规则
     # 只去掉逗号分出来的脚注项；中文顿号等分隔交给 kb.parse
     parts = [p for p in parts if p and not FOOTNOTE_RE.match(p)]
     return ", ".join(parts) or None
