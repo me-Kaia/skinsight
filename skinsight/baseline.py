@@ -4,8 +4,10 @@
 
     python -m skinsight.baseline --csv data/cosmetics.csv
     python -m skinsight.baseline --synthetic
+    python -m skinsight.baseline --csv data/cosmetics.csv --task category   # 产品类别多分类
 
-另外输出「全部预测为适合」的平凡基线，标签正样本比例很高时它的 F1 并不低，可作参照。
+另外输出平凡基线作参照：肤质任务是「全部预测为适合」（标签正样本比例很高时它的 F1 并不低），
+类别任务是「全部预测为训练集最多的类」。
 需要 scikit-learn。
 """
 from __future__ import annotations
@@ -18,8 +20,8 @@ from pathlib import Path
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.linear_model import LogisticRegression
 
-from .data_utils import (LABELS, auc_scores, f1_scores, load_cosmetics_csv, load_jsonl, make_synthetic,
-                         split_samples)
+from .data_utils import (CATEGORIES, LABELS, auc_scores, f1_scores, load_cosmetics_csv, load_jsonl,
+                         make_synthetic, multiclass_scores, split_samples)
 from .kb import KnowledgeBase
 
 
@@ -49,6 +51,36 @@ def fit_predict(train, evals, C: float, min_df: int):
     return preds, probs
 
 
+def run_category(train, val, test, args):
+    """产品类别多分类：一个多项逻辑回归，C 按验证集 macro-F1 选。"""
+    vec = CountVectorizer(analyzer=lambda toks: toks, binary=True, min_df=args.min_freq)
+    X = vec.fit_transform([t for t, _ in train]); y = [c for _, c in train]
+    Xv, Xt = vec.transform([t for t, _ in val]), vec.transform([t for t, _ in test])
+    yv, yt = [c for _, c in val], [c for _, c in test]
+    n = len(CATEGORIES)
+    best = None
+    for C in (0.01, 0.03, 0.1, 0.3, 1.0, 3.0):
+        clf = LogisticRegression(C=C, class_weight="balanced", max_iter=3000).fit(X, y)
+        m = multiclass_scores(yv, clf.predict(Xv).tolist(), n)
+        print(f"C={C:<5} val acc {m['acc']:.3f} | macro-F1 {m['macro_f1']:.3f}")
+        if best is None or m["macro_f1"] > best[1]["macro_f1"]:
+            best = (C, m, clf)
+    C, val_m, clf = best
+    test_m = multiclass_scores(yt, clf.predict(Xt).tolist(), n)
+    majority = max(range(n), key=y.count)
+    maj_m = multiclass_scores(yt, [majority] * len(yt), n)
+    per = lambda m: "  ".join(f"{c}:{f:.2f}" for c, f in zip(CATEGORIES, m["f1"]))
+    print(f"best C={C}")
+    print(f"test logreg   acc {test_m['acc']:.3f} | macro-F1 {test_m['macro_f1']:.3f} | {per(test_m)}")
+    print(f"test majority acc {maj_m['acc']:.3f} | macro-F1 {maj_m['macro_f1']:.3f} （{CATEGORIES[majority]}）")
+    if args.metrics_out:
+        Path(args.metrics_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.metrics_out).write_text(json.dumps(
+            {"model": "logreg-bow", "task": "category", "args": vars(args), "C": C,
+             "val_macro_f1": val_m["macro_f1"], "n": [len(train), len(val), len(test)],
+             "test": test_m, "majority": maj_m}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -58,18 +90,23 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--min-freq", type=int, default=2, help="同 train.py 的词表最小词频")
     p.add_argument("--keep-unlabeled", action="store_true")
+    p.add_argument("--task", choices=["skin", "category"], default="skin")
     p.add_argument("--metrics-out")
     args = p.parse_args(argv)
+    if args.task == "category" and not args.csv:
+        p.error("--task category 需要 --csv")
 
     kb = KnowledgeBase()
     if args.csv:
-        samples = load_cosmetics_csv(args.csv, kb, drop_unlabeled=not args.keep_unlabeled)
+        samples = load_cosmetics_csv(args.csv, kb, drop_unlabeled=not args.keep_unlabeled, task=args.task)
     elif args.jsonl:
         samples = load_jsonl(args.jsonl, kb)
     else:
         samples = make_synthetic(kb, seed=args.seed)
     train, val, test = split_samples(samples, seed=args.seed)
     print(f"样本 train/val/test = {len(train)}/{len(val)}/{len(test)}")
+    if args.task == "category":
+        return run_category(train, val, test, args)
 
     y_val, y_test = [y for _, y in val], [y for _, y in test]
     best = None

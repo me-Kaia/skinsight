@@ -1,8 +1,13 @@
 import unittest
 
 from skinsight.conflicts import check_routine
-from skinsight.data_utils import (LABELS, Vocab, auc_scores, clean_ingredients, make_synthetic,
-                                  split_samples, to_tokens)
+import csv
+import os
+import tempfile
+
+from skinsight.data_utils import (CATEGORIES, LABELS, Vocab, auc_scores, clean_ingredients,
+                                  kb_feature_matrix, kb_feature_names, load_cosmetics_csv,
+                                  make_synthetic, multiclass_scores, split_samples, to_tokens)
 from skinsight.kb import KnowledgeBase
 
 try:
@@ -57,6 +62,34 @@ class TestData(unittest.TestCase):
         self.assertEqual(auc_scores(y, [[0.9] * 5, [0.1] * 5, [0.8] * 5, [0.2] * 5]), [1.0] * 5)
         self.assertEqual(auc_scores(y, [[1] * 5] * 4), [0.5] * 5)  # 全预测为正
 
+    def test_multiclass_scores(self):
+        m = multiclass_scores([0, 1, 2, 2], [0, 1, 2, 1], 3)
+        self.assertEqual(m["acc"], 0.75)
+        self.assertAlmostEqual(m["f1"][2], 2 / 3)
+
+    def test_kb_features(self):
+        v = Vocab(["<pad>", "<unk>", "raw:foo", "parfum", "water"])
+        names = kb_feature_names(kb)
+        f = kb_feature_matrix(v, kb)
+        self.assertEqual(len(f), len(v)); self.assertEqual(len(f[0]), len(names))
+        self.assertEqual(f[0], [0.0] * len(names))  # pad
+        self.assertEqual(f[2], [0.0] * len(names))  # 未识别成分
+        self.assertEqual(f[3][names.index("fragrance")], 1.0)
+
+    def test_cosmetics_csv_tasks(self):
+        rows = [["Moisturizer", "Water, Glycerin, Squalane", 1, 1, 0, 0, 1],
+                ["Cleanser", "Water, Glycerin, Fragrance", 0, 0, 0, 0, 0],  # 肤质未标注
+                ["Cleanser", "Water, Glycerin, Squalane", 1, 0, 0, 0, 0],   # 与第 1 行成分表重复
+                ["Face Mask", "No Info", 1, 1, 1, 1, 1]]
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.csv")
+            with open(p, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f); w.writerow(["Label", "Ingredients", *LABELS]); w.writerows(rows)
+            skin = load_cosmetics_csv(p, kb)
+            cat = load_cosmetics_csv(p, kb, task="category")
+        self.assertEqual([y for _, y in skin], [[1.0, 1.0, 0.0, 0.0, 1.0]])
+        self.assertEqual([y for _, y in cat], [CATEGORIES.index("Moisturizer"), CATEGORIES.index("Cleanser")])
+
 
 class TestClean(unittest.TestCase):
     def test_placeholders_and_marketing_dropped(self):
@@ -88,6 +121,22 @@ class TestModel(unittest.TestCase):
         self.assertTrue(torch.allclose(attn.sum(-1), torch.ones(2)))
         self.assertTrue(torch.all(attn[1, 1:] == 0))  # padding 不分配注意力
         torch.nn.functional.binary_cross_entropy_with_logits(logits, y).backward()
+
+    def test_kb_feats_and_category(self):
+        from skinsight.model import SkinTypeNet
+        from skinsight.train import collate
+        m = SkinTypeNet(vocab_size=10, num_labels=6, max_len=16, kb_feat_dim=3)
+        m.kb_feats.copy_(torch.rand(10, 3))
+        x, y = collate([([3, 4], 2), ([5], 0)])
+        self.assertEqual(y.dtype, torch.long)
+        logits, _ = m(x)
+        torch.nn.functional.cross_entropy(logits, y).backward()
+        self.assertIsNotNone(m.kb_proj.weight.grad)
+        # kb_feats 随 state_dict 保存；旧 checkpoint 的 config 没有 kb_feat_dim 也能加载
+        m2 = SkinTypeNet(**m.config); m2.load_state_dict(m.state_dict())
+        self.assertTrue(torch.equal(m2.kb_feats, m.kb_feats))
+        old = SkinTypeNet(vocab_size=10, max_len=16).config; old.pop("kb_feat_dim")
+        SkinTypeNet(**old)
 
 
 if __name__ == "__main__":

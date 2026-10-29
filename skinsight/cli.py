@@ -34,7 +34,10 @@ def cmd_analyze(args, kb):
             print(f"  {ICON[level]}{msg}")
     if args.ckpt:
         from .predict import Predictor  # 只有需要时才导入 torch
-        pred = Predictor(args.ckpt, kb)
+        try:
+            pred = Predictor(args.ckpt, kb)
+        except ValueError as e:
+            raise SystemExit(f"错误：{e}")
         probs, top = pred.predict(text)
         print("\n肤质适配度（模型预测）：")
         if pred.synthetic:
@@ -63,8 +66,9 @@ def cmd_check(args, kb):
 
 def main(argv=None):
     # Windows 中文系统重定向/管道输出时默认 GBK，无法编码 ⚠️ 等 emoji
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(prog="skinsight", description="护肤品成分表解读 / 叠用冲突检查")
     sub = p.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("analyze", help="解读一个成分表")

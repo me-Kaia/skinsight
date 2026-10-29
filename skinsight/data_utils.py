@@ -12,6 +12,7 @@ from .kb import KnowledgeBase, normalize
 
 LABELS = ["Combination", "Dry", "Normal", "Oily", "Sensitive"]
 LABELS_ZH = ["混合肌", "干皮", "中性肌", "油皮", "敏感肌"]
+CATEGORIES = ["Cleanser", "Eye cream", "Face Mask", "Moisturizer", "Sun protect", "Treatment"]  # CSV 的 Label 列
 PAD, UNK = "<pad>", "<unk>"
 
 
@@ -86,28 +87,58 @@ def clean_ingredients(text: str) -> str | None:
     return ", ".join(parts) or None
 
 
+def kb_feature_names(kb: KnowledgeBase) -> list[str]:
+    """知识库特征的维度名：刺激等级、致痘等级（各归一化到 0~1）+ 每个 tag 一个 one-hot。"""
+    return ["irritation", "comedogenic", *sorted({t for i in kb.items.values() for t in i.tags})]
+
+
+def kb_feature_matrix(vocab: Vocab, kb: KnowledgeBase) -> list[list[float]]:
+    """[len(vocab), F]：知识库成分 token 取其特征，未识别成分（raw:*）、pad、unk 为零向量。"""
+    names = kb_feature_names(kb)
+    tag_idx = {t: k for k, t in enumerate(names)}
+    rows = []
+    for tok in vocab.itos:
+        row = [0.0] * len(names)
+        ing = kb.items.get(tok)
+        if ing:
+            row[0], row[1] = ing.irritation / 3, ing.comedogenic / 5
+            for t in ing.tags:
+                row[tag_idx[t]] = 1.0
+        rows.append(row)
+    return rows
+
+
 def load_cosmetics_csv(path: str | Path, kb: KnowledgeBase, min_tokens: int = 3,
-                       drop_unlabeled: bool = True, dedupe: bool = True):
+                       drop_unlabeled: bool = True, dedupe: bool = True, task: str = "skin"):
     """读取 Kaggle「Cosmetics datasets」格式的 CSV。
 
-    需要列：Ingredients, Combination, Dry, Normal, Oily, Sensitive（0/1）。
+    需要列：Ingredients, Combination, Dry, Normal, Oily, Sensitive（0/1）；task="category" 时用 Label 列。
+    task="skin"：labels 为 5 个肤质的 0/1；task="category"：labels 为 CATEGORIES 下标，
+    此时不看肤质标签，drop_unlabeled 不起作用。
     drop_unlabeled：去掉 5 个标签全为 0 的行。这类行约占 1/3、在各品类里比例相近，
     更像是「未标注肤质」而不是「不适合任何肤质」，当负样本会引入噪声。
     dedupe：同一成分表只保留第一条（原数据同一产品会出现在多个品类里，否则会跨 train/test 泄漏）。
     返回 [(tokens, labels)]。
     """
+    if task not in ("skin", "category"):
+        raise ValueError(f"未知 task: {task}")
     samples, seen = [], set()
     with open(path, encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             text = clean_ingredients(row.get("Ingredients"))
             if text is None:
                 continue
-            try:
-                labels = [float(row[l]) for l in LABELS]
-            except (KeyError, ValueError):
-                continue
-            if drop_unlabeled and not any(labels):
-                continue
+            if task == "category":
+                if row.get("Label") not in CATEGORIES:
+                    continue
+                labels = CATEGORIES.index(row["Label"])
+            else:
+                try:
+                    labels = [float(row[l]) for l in LABELS]
+                except (KeyError, ValueError):
+                    continue
+                if drop_unlabeled and not any(labels):
+                    continue
             toks = to_tokens(text, kb)
             if len(toks) < min_tokens:
                 continue
@@ -136,6 +167,18 @@ def f1_scores(y_true, y_pred) -> list[float]:
         fn = sum(t[j] and not p[j] for t, p in zip(y_true, y_pred))
         out.append(2 * tp / max(2 * tp + fp + fn, 1))
     return out
+
+
+def multiclass_scores(y_true: list[int], y_pred: list[int], n_classes: int) -> dict:
+    """多分类：accuracy、逐类 F1、macro-F1。"""
+    f1 = []
+    for c in range(n_classes):
+        tp = sum(t == c and p == c for t, p in zip(y_true, y_pred))
+        fp = sum(t != c and p == c for t, p in zip(y_true, y_pred))
+        fn = sum(t == c and p != c for t, p in zip(y_true, y_pred))
+        f1.append(2 * tp / max(2 * tp + fp + fn, 1))
+    acc = sum(t == p for t, p in zip(y_true, y_pred)) / max(len(y_true), 1)
+    return {"acc": acc, "f1": f1, "macro_f1": sum(f1) / n_classes}
 
 
 def auc_scores(y_true, scores) -> list[float | None]:

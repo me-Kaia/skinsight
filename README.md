@@ -46,6 +46,7 @@ python -m skinsight analyze "Water, Glycerin, Fragrance, Coconut Oil" --ckpt che
 
 - **位置有意义**：INCI 成分表按含量从高到低排列（约 1% 以下可任意排序），所以「排第几位」作为位置 embedding 输入，而不是把成分当成无序集合。
 - **知识库对齐词表**：知识库收录的成分用统一 id 作为 token，中文和英文成分表推理时落在同一个 embedding 上。
+- **可选知识库特征**（`--kb-feats`）：刺激/致痘等级和 tags 投影后加到 token embedding 上；实测没有可靠提升，默认关闭，见 [Results](#results)。
 - **类别不平衡**：`BCEWithLogitsLoss` 按正负样本比设置 `pos_weight`，按验证集 macro-F1 选最优 checkpoint。
 
 ## 数据
@@ -155,6 +156,48 @@ python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 3e-
 | 预测 | 1.00 | 0.98 | 0.99 | 0.99 | 0.16 |
 
 注意力最高：丁香酚 Eugenol (0.26)、迷迭香叶油 (0.12)、变性乙醇 (0.11)。模型因为香料致敏原和排第 2 位的酒精判它不适合敏感肌，这个理由本身说得通，但和数据标签（标为适合敏感肌）不一致；干皮也判错了。
+
+### 知识库特征（`--kb-feats`）
+
+每个 token 额外查一个 15 维特征：刺激等级 / 3、致痘等级 / 5，以及知识库 13 个 tag（香精、致敏香料、维A类、AHA、BHA、高位酒精、防晒剂……）的 one-hot；经无偏置线性层投影到 d_model 后加到 token embedding 上，未识别成分是零向量。其余设置与上表完全相同（同种子、同划分、同超参），不加特征的模型与上表是同一批结果。
+
+| 设置 | 方法 | Combination | Dry | Normal | Oily | Sensitive | macro-F1 | macro-AUC |
+|---|---|---|---|---|---|---|---|---|
+| 丢弃全 0 行 | SkinTypeNet | 0.978 | 0.924 | 0.973 | 0.910 | 0.814 | 0.920 ± 0.005 | 0.560 ± 0.072 |
+| 丢弃全 0 行 | + 知识库特征 | 0.981 | 0.918 | 0.981 | 0.919 | 0.807 | 0.921 ± 0.012 | 0.580 ± 0.092 |
+| 保留全 0 行 | SkinTypeNet | 0.787 | 0.749 | 0.775 | 0.721 | 0.674 | 0.741 ± 0.019 | 0.650 ± 0.042 |
+| 保留全 0 行 | + 知识库特征 | 0.791 | 0.750 | 0.778 | 0.731 | 0.679 | 0.746 ± 0.018 | 0.597 ± 0.057 |
+
+**没有可靠的提升。** macro-F1 的变化都在 0.005 以内；macro-AUC 在默认设置下 5 个种子里 4 升 1 降（均值 +0.02，标准差 0.09，远大于差值），保留全 0 行时 4 降 1 平（均值 −0.05）。仍然不如词袋逻辑回归（AUC 0.666 / 0.703）。原因推测：
+
+- 知识库成分本来就各有独立的 token embedding，这 15 维是 token id 的固定函数，对见过的成分不提供新信息，只能作为「相似成分共享方向」的先验；
+- 只有 27.5% 的 token 被识别，13 个 tag 里多数只覆盖 1~3 个成分；
+- 标签本身信号弱（见上），先验帮不上多少。
+
+所以默认不开启。
+
+### 产品类别分类（`--task category`）
+
+用 CSV 的 `Label` 列（Cleanser / Eye cream / Face Mask / Moisturizer / Sun protect / Treatment）做 6 分类。这个任务不用肤质标签，全 0 行也保留，清洗和去重同上，共 1,213 条（971/121/121）。同成分表出现在多个类别时只保留第一条。SkinTypeNet 换成 softmax + 交叉熵（6 类 170~298 条，较均衡，不加权），在种子 42 的验证集上从 lr ∈ {1e-3, 3e-4} × d_model ∈ {64, 128} 选了 lr=3e-4、d_model=64，40 epoch；逻辑回归是多项 LR，`class_weight="balanced"`，C 按验证集 macro-F1 选。5 个种子平均：
+
+| 方法 | Cleanser | Eye cream | Face Mask | Moisturizer | Sun protect | Treatment | accuracy | macro-F1 |
+|---|---|---|---|---|---|---|---|---|
+| 全部预测为训练集最多的类 | — | — | — | — | — | — | 0.167 ± 0.016 | 0.048 ± 0.004 |
+| 词袋 + 逻辑回归 | 0.644 | 0.506 | 0.492 | 0.367 | 0.662 | 0.351 | **0.506 ± 0.029** | **0.504 ± 0.033** |
+| SkinTypeNet | 0.428 | 0.371 | 0.493 | 0.388 | 0.477 | 0.266 | 0.412 ± 0.045 | 0.404 ± 0.052 |
+| SkinTypeNet + 知识库特征 | 0.512 | 0.275 | 0.435 | 0.307 | 0.424 | 0.259 | 0.369 ± 0.084 | 0.369 ± 0.081 |
+
+- 成分表里**确实有类别信号**（两个模型都远高于平凡基线），这和肤质任务不同，说明前面肤质结果差主要是标签问题，而不只是模型问题。
+- 但 SkinTypeNet 比逻辑回归低约 0.10，加知识库特征后更低、方差更大。1 千条左右的数据量对 2 层 Transformer 偏少，词袋线性模型更稳。
+- 逻辑回归里防晒和洁面最好认，面霜和 Treatment（精华等）最难。推测前两者分别有防晒剂、表面活性剂这类标志性成分，后两者成分重叠较大（未逐一验证）。
+
+复现：
+
+```bash
+python -m skinsight.baseline --csv data/cosmetics.csv --task category --seed 1
+python -m skinsight.train --csv data/cosmetics.csv --task category --seed 1 --epochs 40 --lr 3e-4 --d-model 64
+python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 3e-4 --d-model 128 --kb-feats
+```
 
 ## Roadmap
 

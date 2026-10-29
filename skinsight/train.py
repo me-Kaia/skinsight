@@ -3,6 +3,8 @@
     python -m skinsight.train --synthetic                       # 用合成数据跑通流程
     python -m skinsight.train --csv data/cosmetics.csv          # Kaggle Cosmetics datasets
     python -m skinsight.baseline --csv data/cosmetics.csv       # 同划分的词袋 + 逻辑回归对比
+    python -m skinsight.train --csv data/cosmetics.csv --kb-feats            # 加知识库特征
+    python -m skinsight.train --csv data/cosmetics.csv --task category       # 产品类别多分类
     python -m skinsight.train --jsonl data/my_products.jsonl    # 自建数据
 """
 from __future__ import annotations
@@ -17,8 +19,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from .data_utils import (LABELS, Vocab, auc_scores, load_cosmetics_csv, load_jsonl, make_synthetic,
-                         split_samples)
+from .data_utils import (CATEGORIES, LABELS, Vocab, auc_scores, kb_feature_matrix, load_cosmetics_csv,
+                         load_jsonl, make_synthetic, multiclass_scores, split_samples)
 from .kb import KnowledgeBase
 from .model import SkinTypeNet
 
@@ -39,8 +41,20 @@ def collate(batch):
     x = torch.zeros(len(batch), L, dtype=torch.long)
     for i, (ids, _) in enumerate(batch):
         x[i, : len(ids)] = torch.tensor(ids)
-    y = torch.tensor([lab for _, lab in batch], dtype=torch.float)
+    labs = [lab for _, lab in batch]
+    # 多标签（肤质）为 0/1 列表 -> float；多分类（类别）为类下标 -> long
+    y = torch.tensor(labs, dtype=torch.long if isinstance(labs[0], int) else torch.float)
     return x, y
+
+
+@torch.no_grad()
+def evaluate_category(model, loader, device):
+    model.eval()
+    ys, preds = [], []
+    for x, y in loader:
+        logits, _ = model(x.to(device))
+        preds += logits.argmax(-1).cpu().tolist(); ys += y.tolist()
+    return multiclass_scores(ys, preds, len(CATEGORIES))
 
 
 @torch.no_grad()
@@ -61,9 +75,10 @@ def evaluate(model, loader, device):
             "auc": auc_scores(ys, probs)}
 
 
-def fmt(m):
-    per = "  ".join(f"{l}:{f:.2f}" for l, f in zip(LABELS, m["f1"]))
-    return f"macro-F1 {m['macro_f1']:.3f} | {per}"
+def fmt(m, names=LABELS):
+    per = "  ".join(f"{l}:{f:.2f}" for l, f in zip(names, m["f1"]))
+    acc = f"acc {m['acc']:.3f} | " if isinstance(m["acc"], float) else ""  # 多分类才有单个 accuracy
+    return f"{acc}macro-F1 {m['macro_f1']:.3f} | {per}"
 
 
 def main(argv=None):
@@ -83,14 +98,23 @@ def main(argv=None):
     p.add_argument("--min-freq", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--keep-unlabeled", action="store_true", help="CSV：保留 5 个标签全 0 的行（默认丢弃）")
-    p.add_argument("--out", default="checkpoints/skin_type.pt")
+    p.add_argument("--task", choices=["skin", "category"], default="skin",
+                   help="skin：5 种肤质多标签；category：产品类别多分类（只支持 --csv）")
+    p.add_argument("--kb-feats", action="store_true", help="把知识库的刺激/致痘等级和 tags 加到 token embedding 上")
+    p.add_argument("--out", help="默认 checkpoints/skin_type.pt（category 任务为 checkpoints/category.pt）")
     p.add_argument("--metrics-out", help="把 test 指标写成 JSON（便于和 baseline 对比）")
     args = p.parse_args(argv)
+    if args.task == "category" and not args.csv:
+        p.error("--task category 需要 --csv（类别来自 CSV 的 Label 列）")
+    args.out = args.out or ("checkpoints/category.pt" if args.task == "category" else "checkpoints/skin_type.pt")
+    is_cat = args.task == "category"
+    label_names = CATEGORIES if is_cat else LABELS
+    evaluate_fn = evaluate_category if is_cat else evaluate
 
     random.seed(args.seed); torch.manual_seed(args.seed)
     kb = KnowledgeBase()
     if args.csv:
-        samples = load_cosmetics_csv(args.csv, kb, drop_unlabeled=not args.keep_unlabeled)
+        samples = load_cosmetics_csv(args.csv, kb, drop_unlabeled=not args.keep_unlabeled, task=args.task)
     elif args.jsonl:
         samples = load_jsonl(args.jsonl, kb)
     else:
@@ -109,12 +133,20 @@ def main(argv=None):
     train_dl, val_dl, test_dl = mk(train, True), mk(val, False), mk(test, False)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SkinTypeNet(len(vocab), num_labels=len(LABELS), d_model=args.d_model,
-                        num_layers=args.layers, max_len=args.max_len, dropout=args.dropout).to(device)
+    kb_feats = kb_feature_matrix(vocab, kb) if args.kb_feats else None
+    model = SkinTypeNet(len(vocab), num_labels=len(label_names), d_model=args.d_model,
+                        num_layers=args.layers, max_len=args.max_len, dropout=args.dropout,
+                        kb_feat_dim=len(kb_feats[0]) if kb_feats else 0)
+    if kb_feats:
+        model.kb_feats.copy_(torch.tensor(kb_feats))
+    model = model.to(device)
 
     ys = torch.tensor([y for _, y in train])
-    pos = ys.sum(0).clamp(min=1)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=((len(ys) - pos) / pos).to(device))
+    if is_cat:
+        loss_fn = nn.CrossEntropyLoss()  # 6 个类别 170~298 条，比较均衡，不加权
+    else:
+        pos = ys.sum(0).clamp(min=1)
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=((len(ys) - pos) / pos).to(device))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
 
     best, best_state, best_epoch = -1.0, None, 0
@@ -127,16 +159,16 @@ def main(argv=None):
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); total += loss.item() * x.size(0)
-        m = evaluate(model, val_dl, device)
-        print(f"epoch {epoch:3d} | loss {total / len(train):.4f} | val {fmt(m)}")
+        m = evaluate_fn(model, val_dl, device)
+        print(f"epoch {epoch:3d} | loss {total / len(train):.4f} | val {fmt(m, label_names)}")
         if m["macro_f1"] > best:
             best, best_epoch = m["macro_f1"], epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     model.load_state_dict(best_state)
-    test_m = evaluate(model, test_dl, device)
+    test_m = evaluate_fn(model, test_dl, device)
     print(f"best epoch {best_epoch} (val macro-F1 {best:.3f})")
-    print("test", fmt(test_m))
+    print("test", fmt(test_m, label_names))
     if args.metrics_out:
         Path(args.metrics_out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.metrics_out).write_text(json.dumps(
@@ -145,7 +177,7 @@ def main(argv=None):
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model": best_state, "config": model.config, "vocab": vocab.to_dict(),
-                "labels": LABELS, "synthetic": bool(args.synthetic)}, args.out)
+                "labels": label_names, "task": args.task, "synthetic": bool(args.synthetic)}, args.out)
     print(f"已保存到 {args.out}")
 
 

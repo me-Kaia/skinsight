@@ -11,6 +11,8 @@ from .model import SkinTypeNet
 class Predictor:
     def __init__(self, ckpt_path: str, kb: KnowledgeBase | None = None):
         ckpt = torch.load(ckpt_path, map_location="cpu")
+        if ckpt.get("task", "skin") != "skin":
+            raise ValueError(f"{ckpt_path} 是 {ckpt['task']} 任务的模型，analyze 只支持肤质模型")
         self.kb = kb or KnowledgeBase()
         self.vocab = Vocab.from_dict(ckpt["vocab"])
         self.model = SkinTypeNet(**ckpt["config"])
