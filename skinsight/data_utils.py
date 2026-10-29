@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -49,27 +50,111 @@ class Vocab:
         return cls(d["itos"])
 
 
-def load_cosmetics_csv(path: str | Path, kb: KnowledgeBase, min_tokens: int = 3):
+PLACEHOLDER_RE = re.compile(r"(?i)^\s*(no info|visit the|#name|this ingredient list is subject to change)")
+DISCLAIMER_RE = re.compile(r"(?i)\s*(please be aware|this ingredient list is subject to change).*$", re.S)
+HEADER_RE = re.compile(r"(?i)^.*?\b(?:inactive |active |other )?ingredients?\s*:")
+WATER_RE = re.compile(r"(?i)\b(water|aqua|eau)\b\s*[,(/]")
+PERCENT_RE = re.compile(r"\s*\(?\d+(?:\.\d+)?\s*%\)?")
+FOOTNOTE_RE = re.compile(r"^\*")  # "*Organic." / "**Natural." 这类脚注；成分名后面的 * 由 normalize 去掉
+
+
+def clean_ingredients(text: str) -> str | None:
+    """清洗网页抓来的成分表；不是成分表（占位符、纯营销文案）时返回 None。
+
+    处理：「-成分: 功效描述」营销文案、"...Ingredients:" 前缀、免责声明、
+    "5.0%Water" 这类浓度粘连、"(and)" / "May Contain:" 分隔、"*Organic." 脚注。
+    """
+    text = (text or "").strip()
+    if not text or PLACEHOLDER_RE.match(text):
+        return None
+    text = DISCLAIMER_RE.sub("", text)
+    if text.startswith("-"):
+        # 丝芙兰的「核心成分」营销文案，后面有时才接真正的成分表
+        m = WATER_RE.search(text)
+        if not m:
+            return None
+        text = text[m.start():]
+    text = HEADER_RE.sub("", text, count=1)
+    text = re.sub(r"%(?=[A-Za-z])", "%, ", text)
+    text = PERCENT_RE.sub("", text)
+    text = re.sub(r"(?i)\(and\)|\bmay contain\s*:?|\[?\+/-\]?", ",", text)
+    text = re.sub(r"\.\s+(?=[A-Z*])", ", ", text)  # 句号分句 -> 分隔符，脚注单独成项
+    text = re.sub(r"\s+(?=\*+\s*[A-Za-z])", ", ", text)  # "Phenoxyethanol * essential oil"
+    parts = [p.strip() for p in re.split(r"(?<!\d),(?!\d)", text)]  # 同 kb.SPLIT_RE，不拆 1,2-己二醇
+    # 只去掉逗号分出来的脚注项；中文顿号等分隔交给 kb.parse
+    parts = [p for p in parts if p and not FOOTNOTE_RE.match(p)]
+    return ", ".join(parts) or None
+
+
+def load_cosmetics_csv(path: str | Path, kb: KnowledgeBase, min_tokens: int = 3,
+                       drop_unlabeled: bool = True, dedupe: bool = True):
     """读取 Kaggle「Cosmetics datasets」格式的 CSV。
 
     需要列：Ingredients, Combination, Dry, Normal, Oily, Sensitive（0/1）。
+    drop_unlabeled：去掉 5 个标签全为 0 的行。这类行约占 1/3、在各品类里比例相近，
+    更像是「未标注肤质」而不是「不适合任何肤质」，当负样本会引入噪声。
+    dedupe：同一成分表只保留第一条（原数据同一产品会出现在多个品类里，否则会跨 train/test 泄漏）。
     返回 [(tokens, labels)]。
     """
-    samples = []
-    with open(path, encoding="utf-8") as f:
+    samples, seen = [], set()
+    with open(path, encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
-            text = (row.get("Ingredients") or "").strip()
-            if not text or text.lower().startswith(("no info", "visit the", "#name")):
-                continue
-            toks = to_tokens(text, kb)
-            if len(toks) < min_tokens:
+            text = clean_ingredients(row.get("Ingredients"))
+            if text is None:
                 continue
             try:
                 labels = [float(row[l]) for l in LABELS]
             except (KeyError, ValueError):
                 continue
+            if drop_unlabeled and not any(labels):
+                continue
+            toks = to_tokens(text, kb)
+            if len(toks) < min_tokens:
+                continue
+            key = tuple(toks)
+            if dedupe and key in seen:
+                continue
+            seen.add(key)
             samples.append((toks, labels))
     return samples
+
+
+def split_samples(samples, seed: int = 42, frac: float = 0.1):
+    """固定种子打乱后切成 train/val/test（val、test 各占 frac）。模型和 baseline 共用。"""
+    samples = list(samples)
+    random.Random(seed).shuffle(samples)
+    n = len(samples); k = max(1, int(n * frac))
+    return samples[2 * k:], samples[k:2 * k], samples[:k]
+
+
+def f1_scores(y_true, y_pred) -> list[float]:
+    """逐标签 F1，y_* 为 [[0/1] * len(LABELS)]；与 train.evaluate 同一口径（无正样本时记 0）。"""
+    out = []
+    for j in range(len(LABELS)):
+        tp = sum(t[j] and p[j] for t, p in zip(y_true, y_pred))
+        fp = sum((not t[j]) and p[j] for t, p in zip(y_true, y_pred))
+        fn = sum(t[j] and not p[j] for t, p in zip(y_true, y_pred))
+        out.append(2 * tp / max(2 * tp + fp + fn, 1))
+    return out
+
+
+def auc_scores(y_true, scores) -> list[float | None]:
+    """逐标签 ROC-AUC（秩统计，并列取平均秩）；某标签只有一类时为 None。与阈值无关，全预测为正时是 0.5。"""
+    out = []
+    for j in range(len(LABELS)):
+        pairs = sorted((s[j], t[j]) for s, t in zip(scores, y_true))
+        n_pos = sum(t for _, t in pairs); n_neg = len(pairs) - n_pos
+        if not n_pos or not n_neg:
+            out.append(None); continue
+        rank_sum, i = 0.0, 0
+        while i < len(pairs):
+            k = i
+            while k < len(pairs) and pairs[k][0] == pairs[i][0]:
+                k += 1
+            rank_sum += sum(t for _, t in pairs[i:k]) * (i + k + 1) / 2  # 秩从 1 开始
+            i = k
+        out.append((rank_sum - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+    return out
 
 
 def load_jsonl(path: str | Path, kb: KnowledgeBase):

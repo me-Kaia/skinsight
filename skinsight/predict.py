@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-from .data_utils import LABELS_ZH, Vocab, to_tokens
+from .data_utils import LABELS_ZH, Vocab, clean_ingredients, to_tokens
 from .kb import KnowledgeBase
 from .model import SkinTypeNet
 
@@ -21,6 +21,7 @@ class Predictor:
 
     @torch.no_grad()
     def predict(self, text: str, top_k: int = 5):
+        text = clean_ingredients(text) or text  # 与训练时的 CSV 清洗保持一致
         items = self.kb.parse(text)[: self.max_len]
         ids = self.vocab.encode(to_tokens(text, self.kb), self.max_len)
         logits, attn = self.model(torch.tensor([ids]))

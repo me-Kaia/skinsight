@@ -1,7 +1,8 @@
 import unittest
 
 from skinsight.conflicts import check_routine
-from skinsight.data_utils import LABELS, Vocab, make_synthetic, to_tokens
+from skinsight.data_utils import (LABELS, Vocab, auc_scores, clean_ingredients, make_synthetic,
+                                  split_samples, to_tokens)
 from skinsight.kb import KnowledgeBase
 
 try:
@@ -43,6 +44,36 @@ class TestData(unittest.TestCase):
         v = Vocab.build([t for t, _ in s], always=list(kb.items))
         self.assertEqual(v.encode([]), [1])
         self.assertEqual(Vocab.from_dict(v.to_dict()).itos, v.itos)
+
+    def test_split_is_deterministic_and_disjoint(self):
+        s = [([str(i)], [0] * 5) for i in range(100)]
+        tr, va, te = split_samples(s, seed=7)
+        self.assertEqual((len(tr), len(va), len(te)), (80, 10, 10))
+        self.assertEqual(split_samples(s, seed=7)[2], te)
+        self.assertEqual(len({t[0][0] for t in tr + va + te}), 100)
+
+    def test_auc(self):
+        y = [[1] * 5, [0] * 5, [1] * 5, [0] * 5]
+        self.assertEqual(auc_scores(y, [[0.9] * 5, [0.1] * 5, [0.8] * 5, [0.2] * 5]), [1.0] * 5)
+        self.assertEqual(auc_scores(y, [[1] * 5] * 4), [0.5] * 5)  # 全预测为正
+
+
+class TestClean(unittest.TestCase):
+    def test_placeholders_and_marketing_dropped(self):
+        for t in ["No Info", "#NAME?", "Visit the Dior boutique", "-Vitamin E: Antioxidant. -Clay: Mattifies."]:
+            self.assertIsNone(clean_ingredients(t))
+
+    def test_cosmetics_noise(self):
+        self.assertEqual(
+            clean_ingredients("Avobenzone 3.0%, Octocrylene 5.0%Water, Lemon Oil*, Phenoxyethanol. *Organic. **Natural."),
+            "Avobenzone, Octocrylene, Water, Lemon Oil*, Phenoxyethanol")
+        self.assertEqual(clean_ingredients("Crm Division: El (Estee Lauder)Ingredients: Water , 1,2-Hexanediol"),
+                         "Water, 1,2-Hexanediol")
+        self.assertEqual(clean_ingredients("-Hyaluronic Acid: Hydrates. Complex: Water, Squalane"), "Water, Squalane")
+        self.assertEqual(clean_ingredients("Organic Argan Oil*. *Organic."), "Organic Argan Oil*")
+
+    def test_chinese_untouched(self):
+        self.assertEqual(clean_ingredients("水、甘油、1,2-己二醇，香精"), "水、甘油、1,2-己二醇，香精")
 
 
 @unittest.skipIf(torch is None, "未安装 torch")
