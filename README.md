@@ -59,7 +59,7 @@ python -m skinsight analyze "Water, Glycerin, Fragrance, Coconut Oil" --ckpt che
 | [Open Beauty Facts](https://world.openbeautyfacts.org/)（ODbL） | 1.4 万条无标签成分表，只用于自监督预训练，放在 `data/openbeautyfacts/`（不入库），见 [Pretraining](#pretraining) |
 | 自建 JSONL `--jsonl` | 每行 `{"ingredients": "水, 甘油, ...", "labels": {"Dry": 1, "Sensitive": 1}}` |
 
-知识库在 `skinsight/data/ingredients.json`，目前收录 64 个常见成分，欢迎 PR 补充。
+知识库在 `skinsight/data/ingredients.json`，当前版本 v0.2 收录 377 个成分（v0.1 为 64 个），按 Kaggle 数据和 Open Beauty Facts 语料中的出现频率补充。中文名（`zh`）以《已使用化妆品原料目录（2021年版）》标准名为准，常用叫法放在 `aliases`，少数成分另有用于显示的常用名 `common_zh`（显示为「依克多因（四氢甲基嘧啶羧酸）」）；已核实的刺激/致痘等级在 `note` 里写明依据，没把握的填 0 并标注「待核实」。欢迎 PR 补充。下面的实验结果基于 v0.1，见 [Results](#results)。
 
 ## 项目结构
 
@@ -82,6 +82,8 @@ tests/                      单元测试：python -m unittest discover -s tests
 ## Results
 
 在 Kaggle Cosmetics datasets 上的结果。**结论先说：在这份数据上，SkinTypeNet 和词袋逻辑回归都没有超过「全部预测为适合」的平凡基线（macro-F1）；按 ROC-AUC 看，逻辑回归学到了一点信号，SkinTypeNet 更弱，预训练也没有改变这个排序（见 [Pretraining](#pretraining)）。** 主要原因在数据本身，见下。
+
+> **知识库版本**：本节所有实验结果（包括识别率、各表格和预测示例）都是基于旧版知识库 **v0.1**（64 个成分）得出的，知识库扩充到 v0.2 后没有重跑。
 
 > **切分 bug 修复**：早期版本把英文逗号的切分规则写成了「逗号任意一侧是数字就不切」，本意是保护 `1,2-Hexanediol`，结果 `Polyquaternium-7, Parfum`、`Steareth-10,Dimethicone` 这类成分也被粘成一个 token（约 4% 的 token、66% 的丝芙兰产品受影响）。现在只有逗号**两侧都是数字**时才不切，并补了测试。下面所有数字都是修复后从头重跑的结果（包括预训练），和之前提交里的数字不可比。
 
@@ -208,6 +210,8 @@ python -m skinsight.train --csv data/cosmetics.csv --seed 1 --epochs 40 --lr 1e-
 ## Pretraining
 
 丝芙兰数据只有 1 千条左右，于是试了在更大的**无标签**成分表语料上做自监督预训练，再微调到上面两个任务。
+
+> **知识库版本**：本节的语料统计、预训练和微调结果都基于旧版知识库 **v0.1**，扩充到 v0.2 后没有重跑。
 
 ### 语料：Open Beauty Facts
 

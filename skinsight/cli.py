@@ -24,7 +24,7 @@ def cmd_analyze(args, kb):
             ing = it.ingredient
             mark = "（模糊匹配）" if it.match == "fuzzy" else ""
             func = "/".join(ing.functions) or "-"
-            print(f"  {it.position + 1:>2}. {ing.zh}（{ing.inci}）{mark}  [{func}]")
+            print(f"  {it.position + 1:>2}. {ing.display}  {ing.inci}{mark}  [{func}]")
         else:
             print(f"  {it.position + 1:>2}. {it.raw}  [未收录]")
     flags = summarize_flags(items)

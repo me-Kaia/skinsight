@@ -41,6 +41,41 @@ class TestKB(unittest.TestCase):
         self.assertEqual((ing.id, how), ("niacinamide", "fuzzy"))
         self.assertIsNone(kb.lookup("Totally Unknown Thing")[0])
 
+    def test_lookup_variants(self):
+        ids = lambda *names: [getattr(kb.lookup(n)[0], "id", None) for n in names]
+        # 只差空格/标点、斜杠并列写法、括号不闭合
+        self.assertEqual(ids("Benzylalcohol", "Caprylic/ Capric Triglyceride", "CI 77891/Titanium Dioxide",
+                             "Iron Oxides (CI 77491", "CI 77499)"),
+                         ["benzyl_alcohol", "caprylic_capric_tg", "titanium_dioxide", "ci_77491", "ci_77499"])
+        self.assertIsNone(kb.lookup("Dimethicone/Vinyl Dimethicone Crosspolymer")[0])  # 各部分不是同一个成分
+        # 模糊匹配只容忍拼写错误
+        self.assertEqual(ids("Xantham Gum", "Citronelol"), ["xanthan_gum", "citronellol"])
+        for name, wrong in [("Laureth-9", "laureth_4"), ("Sodium Myreth Sulfate", "sles"),
+                            ("Glyceryl Isostearate", "glyceryl_stearate"), ("Simethicone", "dimethicone")]:
+            self.assertNotEqual(getattr(kb.lookup(name)[0], "id", None), wrong, name)
+
+    def test_display_name_and_hints(self):
+        from skinsight.kb import ingredient_hints, summarize_flags, user_note
+        self.assertEqual(kb.lookup("Ectoin")[0].display, "依克多因（四氢甲基嘧啶羧酸）")
+        self.assertEqual(kb.lookup("Glycerin")[0].display, "甘油")  # 没有常用名
+        self.assertEqual(kb.lookup("依克多因")[0].id, "ectoin")
+        dmdm = kb.lookup("DMDM Hydantoin")[0]
+        self.assertIn("甲醛释放体", ingredient_hints(dmdm))
+        self.assertTrue(any("甲醛释放体" in m for _, m in summarize_flags(kb.parse("Water, DMDM Hydantoin"))))
+        # 给维护者看的出处、审核记录不展示给用户
+        self.assertNotRegex(user_note(kb.lookup("p-Aminophenol")[0]), "审核意见|待核实|目录")
+
+    def test_tags_used_by_conflicts(self):
+        tags = lambda n: set(kb.lookup(n)[0].tags)
+        self.assertIn("bha", tags("Capryloyl Salicylic Acid"))
+        self.assertIn("retinoid", tags("Retinal"))
+        self.assertIn("fragrance_allergen", tags("Hexyl Cinnamal"))
+        self.assertIn("sunscreen", tags("Ethylhexyl Methoxycinnamate"))
+        self.assertFalse({"bha", "aha"} & tags("Ethylhexyl Salicylate"))  # 防晒剂，不是酸
+        self.assertNotIn("vitamin_c_pure", tags("Sorbic Acid"))
+        f = check_routine([("A", kb.parse("Water, Retinal")), ("B", kb.parse("Water, Capryloyl Salicylic Acid"))])
+        self.assertEqual(f[0].level, "high")
+
 
 class TestConflicts(unittest.TestCase):
     def test_retinoid_plus_acid_is_high(self):
