@@ -15,6 +15,10 @@ DEFAULT_KB = Path(__file__).parent / "data" / "ingredients.json"
 COMMA_RE = r"(?<!\d),|,(?!\d)"
 # 按逗号/顿号/分号/换行切分
 SPLIT_RE = re.compile(COMMA_RE + r"|[，、;；\n]+")
+# 国内标签「其他微量成分：」（含量 ≤ 0.1%）之后的成分标记为微量；TRACE_MARK 是 OCR 截取时统一写入的写法
+TRACE_RE = re.compile(r"^\s*(?:其他|其它)?(?:微量|次要)成分\s*[:：]\s*")
+TRACE_MARK = "其他微量成分："
+TRACE_NOTE = "≤0.1%"
 PAREN_RE = re.compile(r"[(（]([^)）]*)[)）]")
 DIGITS_RE = re.compile(r"\d+")
 COMPACT_RE = re.compile(r"[\s/.,\-]+")
@@ -71,6 +75,7 @@ class ParsedItem:
     position: int                     # 在成分表中的位置（0 起）；越靠前通常浓度越高
     ingredient: Optional[Ingredient]  # 未识别时为 None
     match: str                        # exact / paren / fuzzy / none
+    trace: bool = False               # 在「其他微量成分：」之后（国内标签规定含量 ≤ 0.1%）
 
 
 class KnowledgeBase:
@@ -140,7 +145,13 @@ class KnowledgeBase:
     def parse(self, text: str) -> list[ParsedItem]:
         parts = [p for p in SPLIT_RE.split(text) if normalize(p)]
         out = []
+        trace = False
         for raw in parts:
+            m = TRACE_RE.match(raw)
+            if m:
+                trace, raw = True, raw[m.end():]
+                if not normalize(raw):
+                    continue
             ing, how = self.lookup(raw)
             pieces = [p for p in raw.split("/") if normalize(p)]
             if ing is None and len(pieces) > 1:
@@ -148,9 +159,9 @@ class KnowledgeBase:
                 hits = [self.lookup(p) for p in pieces]
                 if all(i for i, _ in hits):
                     for p, (i, h) in zip(pieces, hits):
-                        out.append(ParsedItem(raw=p.strip(), position=len(out), ingredient=i, match=h))
+                        out.append(ParsedItem(raw=p.strip(), position=len(out), ingredient=i, match=h, trace=trace))
                     continue
-            out.append(ParsedItem(raw=raw.strip(), position=len(out), ingredient=ing, match=how))
+            out.append(ParsedItem(raw=raw.strip(), position=len(out), ingredient=ing, match=how, trace=trace))
         return out
 
 
@@ -215,12 +226,19 @@ def summarize_flags(items: list[ParsedItem]) -> list[tuple[str, str]]:
         "vitamin_c_pure": "纯VC", "vitamin_c_derivative": "VC衍生物",
         "niacinamide": "烟酰胺", "copper_peptide": "铜肽", "benzoyl_peroxide": "过氧化苯甲酰",
     }
-    found = []
+    main, trace = [], []
     for tag, label in actives.items():
-        if any(tag in it.ingredient.tags for it in known) and label not in found:
-            found.append(label)
-    if found:
-        flags.append(("note", "主要活性成分：" + "、".join(found)))
+        hits = [it for it in known if tag in it.ingredient.tags]
+        if not hits or label in main + trace:
+            continue
+        # 只出现在「其他微量成分」里的活性成分单独说明
+        (trace if all(it.trace for it in hits) else main).append(label)
+    if main or trace:
+        parts = ["、".join(main)] if main else []
+        if trace:
+            parts.append("、".join(trace) + (f"（均为微量成分，{TRACE_NOTE}，作用可能有限）" if len(trace) > 1
+                                              else f"（微量成分，{TRACE_NOTE}，作用可能有限）"))
+        flags.append(("note", "含有的活性成分：" + "；".join(parts)))
     return flags
 
 
@@ -246,9 +264,13 @@ def population_notes(items: list[ParsedItem]) -> list[tuple[str, str]]:
     com = [i for i in known if i.comedogenic >= 4]
     if com:
         notes.append(("易长闭口/痘痘者", f"含致痘评分较高的成分（{names(com)}），留意使用后是否长闭口（评分来自早期动物实验，仅供参考）。"))
-    ret = has("retinoid")
-    if ret:
-        notes.append(("备孕、孕期、哺乳期", f"含维A类（{names(ret)}），一般建议避免使用，使用前请咨询医生。"))
+    ret = [it for it in items if it.ingredient and "retinoid" in it.ingredient.tags]
+    if ret and all(it.trace for it in ret):
+        notes.append(("备孕、孕期、哺乳期",
+                      f"含微量维A类（{TRACE_NOTE}），备孕、孕期、哺乳期建议咨询医生（{names([it.ingredient for it in ret])}）。"))
+    elif ret:
+        notes.append(("备孕、孕期、哺乳期",
+                      f"含维A类（{names([it.ingredient for it in ret])}），一般建议避免使用，使用前请咨询医生。"))
     strong = has("aha", "bha", "pha", "vitamin_c_pure") + [i for i in known if i.irritation >= 3]
     if strong:
         notes.append(("屏障受损、医美术后", f"含酸类/纯VC/高刺激成分（{names(strong)}），慎用；术后护理请遵医嘱。"))

@@ -13,8 +13,8 @@ import re
 
 from skinsight.conflicts import LEVEL_ZH, check_routine
 from skinsight.iecic import Catalog
-from skinsight.kb import (POPULATION_FOOTNOTE, KnowledgeBase, ingredient_hints, population_notes, summarize_flags,
-                          user_note)
+from skinsight.kb import (POPULATION_FOOTNOTE, TRACE_NOTE, KnowledgeBase, ingredient_hints, population_notes,
+                          summarize_flags, user_note)
 
 KB = KnowledgeBase()
 CATALOG = Catalog()  # 《已使用化妆品原料目录》备用字典：知识库没收录的成分用它确认、给疑似错字找候选
@@ -181,6 +181,9 @@ def analyze(text: str) -> tuple[str, str, list, list[list], list[str]]:
     n_unk = len(items) - n_known - n_cat
     lines = [f"共 **{len(items)}** 个成分：知识库已解读 **{n_known}** 个，"
              f"原料目录登记但暂无解读 **{n_cat}** 个，未识别 **{n_unk}** 个。"]
+    n_trace = sum(it.trace for it in items)
+    if n_trace:
+        lines.append(f"其中 **{n_trace}** 个在「其他微量成分」之后，按国内标签规定含量 {TRACE_NOTE}，表格里标为「微量」。")
     if n_unk:
         lines.append("未识别的成分可能是 OCR 认错了字，请对照包装核对；下方有原料目录里的候选名称可以勾选替换。")
     flags = summarize_flags(items)
@@ -204,6 +207,9 @@ def analyze(text: str) -> tuple[str, str, list, list[list], list[str]]:
         hints = "、".join(ingredient_hints(ing))
         note = user_note(ing)
         rows.append([it.position + 1, it.raw, name, func, "；".join(x for x in (hints, note) if x)])
+    for it, row in zip(items, rows):
+        if it.trace:
+            row[4] = "；".join(x for x in (f"微量（{TRACE_NOTE}）", row[4]) if x)
     return "\n".join(lines), population_md(items), highlight(items), rows, suggestions_for(items)
 
 

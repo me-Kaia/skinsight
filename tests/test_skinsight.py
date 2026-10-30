@@ -271,11 +271,12 @@ class TestScreenshotRegression(unittest.TestCase):
     def check_augustinus(self, text):
         # 左边瓶身上的品牌名、AB 标志不能混进成分表
         self.assertNotRegex(text, "Augustinus|Bader|NB|AB")
-        self.assertNotIn("微量成分", text)  # 小标题当分隔符
+        # 小标题不粘到前一个成分上，保留成统一的微量标记
+        self.assertIn("向日葵（HELIANTHUS ANNUUS）籽油、其他微量成分：乙醇、", text)
+        self.assertEqual(text.count("微量成分"), 1)
         self.assertTrue(text.startswith("水、辛酸/"))
         self.assertTrue(text.endswith("水蒜芥（SISYMBRIUM IRIO）籽油、寡肽-4"))
-        for name in ["牛油果树（BUTYROSPERMUM PARKII）果脂", "向日葵（HELIANTHUS ANNUUS）籽油、乙醇",
-                     "视黄醇棕榈酸酯", "棕榈酸、神经酰胺"]:
+        for name in ["牛油果树（BUTYROSPERMUM PARKII）果脂", "视黄醇棕榈酸酯", "棕榈酸、神经酰胺"]:
             self.assertIn(name, text)
         items = kb.parse(text)
         self.assertEqual(len(items), 46)
@@ -289,6 +290,49 @@ class TestScreenshotRegression(unittest.TestCase):
 
     def test_augustinus_bader(self):
         self.check_augustinus(self.extract("augustinus_bader"))
+
+    def test_augustinus_trace_ingredients(self):
+        """「其他微量成分」之后（≤0.1%）的成分：活性成分说明、叠用降级、孕期提示措辞、表格标记。"""
+        import app
+        from skinsight.conflicts import check_routine
+        from skinsight.kb import population_notes, summarize_flags
+        items = kb.parse(self.extract("augustinus_bader"))
+        trace = [it.raw for it in items if it.trace]
+        self.assertEqual(trace[0], "乙醇")                       # 标记之后才算微量
+        self.assertFalse(any(it.trace for it in items if it.raw == "向日葵（HELIANTHUS ANNUUS）籽油"))
+        self.assertEqual(len(trace), 29)
+        ret = next(it for it in items if it.ingredient and it.ingredient.id == "retinyl_palmitate")
+        self.assertTrue(ret.trace)
+        # 1. 活性成分提示
+        msgs = [m for _, m in summarize_flags(items)]
+        self.assertNotIn("主要活性成分", "".join(msgs))
+        self.assertIn("含有的活性成分：维A类、纯VC、VC衍生物（均为微量成分，≤0.1%，作用可能有限）", msgs)
+        # 2. 叠用检查：微量成分触发的冲突降一级，并注明
+        f = check_routine([("AB乳霜", items), ("果酸水", kb.parse("水、乙醇酸、甘油"))])
+        hit = next(x for x in f if x.message.startswith("维A类 + 酸类"))
+        self.assertEqual(hit.level, "medium")                      # 原本是 high
+        self.assertIn("AB乳霜中的维A类只是微量成分，≤0.1%", hit.message)
+        f2 = check_routine([("A醇精华", kb.parse("水、视黄醇")), ("果酸水", kb.parse("水、乙醇酸、甘油"))])
+        self.assertEqual(f2[0].level, "high")                      # 不是微量的照旧
+        # 3. 需注意人群：微量维A类保留提示，换措辞
+        self.assertTrue(dict(population_notes(items))["备孕、孕期、哺乳期"].startswith(
+            "含微量维A类（≤0.1%），备孕、孕期、哺乳期建议咨询医生"))
+        # 表格：微量成分在提示列标出
+        rows = app.analyze(self.extract("augustinus_bader"))[3]
+        row = next(r for r in rows if r[1] == "视黄醇棕榈酸酯")
+        self.assertTrue(row[4].startswith("微量（≤0.1%）"))
+        self.assertNotIn("微量", next(r for r in rows if r[1] == "甘油")[4])
+
+    def test_no_trace_header_keeps_old_logic(self):
+        from skinsight.conflicts import check_routine
+        from skinsight.kb import population_notes, summarize_flags
+        items = kb.parse("水、甘油、视黄醇棕榈酸酯、抗坏血酸")
+        self.assertFalse(any(it.trace for it in items))
+        self.assertIn("含有的活性成分：维A类、纯VC", [m for _, m in summarize_flags(items)])
+        self.assertTrue(dict(population_notes(items))["备孕、孕期、哺乳期"].startswith("含维A类"))
+        self.assertEqual(check_routine([("A", items), ("B", kb.parse("水、乙醇酸"))])[0].level, "high")
+        # 粘贴的成分表里自带「其他微量成分：」也一样识别
+        self.assertTrue(kb.parse("水、甘油、其他微量成分：视黄醇")[-1].trace)
 
     def test_curel_mask(self):
         text = self.extract("curel_mask")

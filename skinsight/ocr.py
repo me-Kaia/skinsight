@@ -8,13 +8,15 @@ from __future__ import annotations
 import math
 import re
 
-from .kb import COMMA_RE, normalize
+from .kb import COMMA_RE, TRACE_MARK, normalize
 
 # 成分段开头：「全成分：」「成分：」「配料」「Ingredients:」「INCI:」……（「其他微量成分：」不算）
 HEADER_RE = re.compile(
     r"(全成分(?:表)?|成分表|产品成分|(?<!微量)(?<!其他)(?<!其它)(?<!次要)成分|配料|ingredients?|inci)\s*[:：]?", re.I)
 # 成分表中间的小标题，当作分隔符
-SUBHEAD_RE = re.compile(r"(?:其他|其它)?(?:微量|次要)成分\s*[:：]?|(?:其他|其它)成分\s*[:：]")
+SUBHEAD_RE = re.compile(r"(?:其他|其它)成分\s*[:：]")
+# 「其他微量成分：」保留成统一的标记（kb.parse 据此把后面的成分标为微量），前面补分隔符
+TRACE_HEAD_RE = re.compile(r"(?:其他|其它)?(?:微量|次要)成分\s*[:：]?")
 # 成分段之后常见的其他栏目，遇到就截断
 STOP_RE = re.compile(
     r"(使用方法|用法|使用说明|注意事项|警示|警告|保质期|限期使用日期|生产日期|生产批号|批号|净含量|规格|执行标准|"
@@ -182,7 +184,8 @@ def extract_ingredients(lines: list[str], kb=None, catalog=None) -> tuple[str, b
         body.append(line)
     text = ""
     for line in body:
-        text = _join(text, SUBHEAD_RE.sub("、", line).strip(), kb=kb)
+        line = TRACE_HEAD_RE.sub("、" + TRACE_MARK, SUBHEAD_RE.sub("、", line))
+        text = _join(text, line.strip(), kb=kb)
     text = re.sub(r"[、，,]\s*[、，,]", "、", text)  # 小标题前后本来就有分隔符时去重
     text = re.sub(r"(?<=[一-鿿）)])\s*[.。]\s*(?=\S)", "、", text)  # 中文后面的句点多半是认错的逗号
     text = re.sub(r"\s*([，、;；])\s*", r"\1", text)          # 中文分隔符前后不留空格
