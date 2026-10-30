@@ -315,8 +315,10 @@ class TestScreenshotRegression(unittest.TestCase):
         f2 = check_routine([("A醇精华", kb.parse("水、视黄醇")), ("果酸水", kb.parse("水、乙醇酸、甘油"))])
         self.assertEqual(f2[0].level, "high")                      # 不是微量的照旧
         # 3. 需注意人群：微量维A类保留提示，换措辞
-        self.assertTrue(dict(population_notes(items))["备孕、孕期、哺乳期"].startswith(
-            "含微量维A类（≤0.1%），备孕、孕期、哺乳期建议咨询医生"))
+        notes = dict(population_notes(items))
+        self.assertTrue(notes["备孕、孕期、哺乳期"].startswith("含微量维A类（≤0.1%），备孕、孕期、哺乳期建议咨询医生"))
+        # 屏障受损、医美术后：只由微量的纯VC触发，保留提示并注明微量，措辞与孕期提示一致
+        self.assertTrue(notes["屏障受损、医美术后"].startswith("含微量纯VC（≤0.1%），屏障受损、医美术后建议咨询医生"))
         # 表格：微量成分在提示列标出
         rows = app.analyze(self.extract("augustinus_bader"))[3]
         row = next(r for r in rows if r[1] == "视黄醇棕榈酸酯")
@@ -331,8 +333,13 @@ class TestScreenshotRegression(unittest.TestCase):
         self.assertIn("含有的活性成分：维A类、纯VC", [m for _, m in summarize_flags(items)])
         self.assertTrue(dict(population_notes(items))["备孕、孕期、哺乳期"].startswith("含维A类"))
         self.assertEqual(check_routine([("A", items), ("B", kb.parse("水、乙醇酸"))])[0].level, "high")
+        self.assertTrue(dict(population_notes(items))["屏障受损、医美术后"].startswith("含纯VC（"))
         # 粘贴的成分表里自带「其他微量成分：」也一样识别
         self.assertTrue(kb.parse("水、甘油、其他微量成分：视黄醇")[-1].trace)
+        # 微量和非微量混合：保留原措辞，微量的那个单独标注
+        mixed = dict(population_notes(kb.parse("水、乙醇酸、其他微量成分：抗坏血酸")))["屏障受损、医美术后"]
+        self.assertIn("抗坏血酸（维生素C）（微量）", mixed)
+        self.assertIn("慎用；术后护理请遵医嘱", mixed)
 
     def test_curel_mask(self):
         text = self.extract("curel_mask")

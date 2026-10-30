@@ -271,7 +271,18 @@ def population_notes(items: list[ParsedItem]) -> list[tuple[str, str]]:
     elif ret:
         notes.append(("备孕、孕期、哺乳期",
                       f"含维A类（{names([it.ingredient for it in ret])}），一般建议避免使用，使用前请咨询医生。"))
-    strong = has("aha", "bha", "pha", "vitamin_c_pure") + [i for i in known if i.irritation >= 3]
+    acid = {"aha", "bha", "pha"}
+    strong = [it for it in items if it.ingredient and ((acid | {"vitamin_c_pure"}) & set(it.ingredient.tags)
+                                                       or it.ingredient.irritation >= 3)]
     if strong:
-        notes.append(("屏障受损、医美术后", f"含酸类/纯VC/高刺激成分（{names(strong)}），慎用；术后护理请遵医嘱。"))
+        tags = {t for it in strong for t in it.ingredient.tags}
+        label = "/".join(k for k, hit in [("酸类", acid & tags), ("纯VC", "vitamin_c_pure" in tags),
+                                          ("高刺激成分", any(it.ingredient.irritation >= 3 for it in strong))] if hit)
+        if all(it.trace for it in strong):
+            # 措辞与微量维A类的孕期提示一致
+            notes.append(("屏障受损、医美术后", f"含微量{label}（{TRACE_NOTE}），屏障受损、医美术后建议咨询医生"
+                                             f"（{names([it.ingredient for it in strong])}）。"))
+        else:
+            marked = "、".join(dict.fromkeys(it.ingredient.display + ("（微量）" if it.trace else "") for it in strong))
+            notes.append(("屏障受损、医美术后", f"含{label}（{marked}），慎用；术后护理请遵医嘱。"))
     return notes
