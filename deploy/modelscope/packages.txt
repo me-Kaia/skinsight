@@ -1,0 +1,3 @@
+# opencv-python（rapidocr 的依赖）在 Linux 上需要这两个系统库
+libgl1
+libglib2.0-0

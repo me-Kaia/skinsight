@@ -31,32 +31,48 @@ python -m skinsight analyze "Water, Glycerin, Fragrance, Coconut Oil" --ckpt che
 
 ## 网页 Demo
 
-用 Gradio 做的中文网页，两个标签页：「成分解读」（逐个成分的名称、作用和提示）和「叠用检查」（2–4 个产品的冲突和建议）。只用知识库和规则，不展示肤质预测，也不需要 torch。
+用 Gradio 做的中文网页，两个标签页：
+
+- **成分解读**：粘贴成分表，或上传/拍摄成分表照片自动识别文字（识别结果填进可编辑文本框，核对后点「分析」）。显示每个成分的名称、作用和提示，以及「需注意人群」：香精/致敏原 → 敏感肌慎用；致痘评分 ≥ 4 → 易长闭口/痘痘者留意；维A类 → 备孕、孕期、哺乳期一般建议避免；酸类、纯VC、高刺激成分 → 屏障受损、医美术后慎用；甲醛释放体 → 敏感肌慎用；高位酒精 → 干皮、敏感肌留意。只做基于成分规则的提示，不做肤质预测。
+- **叠用检查**：2–4 个产品的冲突和建议。
 
 ```bash
-pip install "gradio>=4.44,<6"
+pip install "gradio>=4.44,<6" "rapidocr_onnxruntime==1.2.3"   # 不装 OCR 也能用，只是不能识别照片
 python app.py        # 打开 http://127.0.0.1:7860
 ```
 
 如果开着系统代理（Clash 等）时启动报 `startup-events failed (code 502)`，先设置 `NO_PROXY=localhost,127.0.0.1` 再启动。
 
+### 拍照识别
+
+- OCR 用 [RapidOCR](https://github.com/RapidAI/RapidOCR)（`rapidocr_onnxruntime`，PP-OCRv3 中英文模型），在本地 CPU 上运行，模型随 pip 包安装，不需要 API key，单张图约 2 秒。
+- 上传的图片读进内存识别，识别后立即删除 Gradio 的上传缓存文件，并清空图片组件；`delete_cache` 每 10 分钟再兜底清理一次。
+- 识别后自动截取「全成分 / 成分 / Ingredients」之后、「使用方法 / 保质期 / Directions」之前的内容；按倾角把文字框排回阅读顺序；把折行断开的成分名拼回去（中文直接拼接，英文补空格、去掉断词连字符，用知识库判断换行处是同一个成分还是漏识别的逗号）；OCR 丢了空格的英文成分名（`ButyleneGlycol`）按知识库换回标准写法。
+
+在合成测试图上的结果（用 Windows 自带字体渲染的成分表，加噪声、模糊、旋转、圆柱形弯曲和反光模拟拍照；不是真实照片，实际效果通常会差一些）：
+
+| 测试图 | 成分完全正确 | 知识库能对上 | 主要问题 |
+|---|---|---|---|
+| 中文、平拍 | 20/20 | 20/20 | — |
+| 英文、平拍、小字 | 22/23 | 23/23 | `Ethylhexylglycerin` 认成 `Ethyihexylglycerin`（l→i），知识库模糊匹配能纠正 |
+| 中文、小字、模糊、偏暗、倾斜 3° | 12/14 | 12/14 | 形近字：氢→氧（氢氧化钠）、育→裔（生育酚） |
+| 瓶身弯曲、文字行接近水平 | 3/16 | 4/16 | 两侧压缩 + 反光处丢字母（`Ethylhexyl` → `Ehyhexy`），逗号丢失导致几个成分粘在一起 |
+| 瓶身弯曲、文字行明显成弧形 | 0/16 | 0/16 | 检测模型找不到正文 |
+
+平拍的标签基本可用；弯曲瓶身是主要短板，页面上提示让文字行保持水平、分段拍摄，并支持「追加到已有文本」逐段识别。知识库认不出的成分会在状态栏提醒用户核对。
+
 ### 部署到魔搭创空间（ModelScope）
 
-`deploy/modelscope/` 里是创空间需要的卡片 `README.md`（YAML 头指定入口 `app.py`）和 `requirements.txt`，`prepare.py` 负责把 demo 用到的文件（`app.py`、知识库、规则引擎，不含模型和训练代码）复制到创空间仓库：
+`deploy/modelscope/` 里是创空间需要的卡片 `README.md`（YAML 头指定入口 `app.py`）、`requirements.txt`（Gradio + RapidOCR）、`packages.txt`（opencv 在 Linux 上需要的 `libgl1`、`libglib2.0-0`），`prepare.py` 负责把 demo 用到的文件（`app.py`、知识库、规则引擎、OCR 文字处理，不含肤质模型和训练代码）复制到一个目录。在 Linux + Python 3.11 的干净环境里按这份 requirements 安装并运行过拍照识别。
+
+网页上传：
 
 1. 在 [魔搭社区](https://www.modelscope.cn/) 登录后「创建创空间」，接入 SDK 选 **Gradio**，云资源选免费 CPU 即可，镜像用默认的最新版本；
-2. 在「个人中心 → 访问令牌」拿到 token，克隆创空间仓库并复制文件：
+2. `python deploy/modelscope/prepare.py D:\skinsight-upload` 生成要上传的文件；
+3. 在「创空间详情 → 空间文件」点「添加文件 → 上传文件」，保持目录结构上传（`skinsight/`、`skinsight/data/` 两层子目录不能打平）；
+4. 点「立即发布」（或设置页的「上线」）。之后更新代码：重新生成、上传覆盖改动过的文件，再点设置页的「重启创空间」。
 
-```bash
-git clone http://oauth2:<your_access_token>@www.modelscope.cn/studios/<your_name>/<studio_name>.git
-python deploy/modelscope/prepare.py <studio_name>
-cd <studio_name>
-git add -A
-git commit -m "Add skinsight demo"
-git push
-```
-
-3. 在创空间页面点「立即发布」（或设置页的「上线」），等部署完成。之后更新代码重新执行第 2 步，再点设置页的「重启创空间」。
+也可以用 git：`git clone http://oauth2:<your_access_token>@www.modelscope.cn/studios/<your_name>/<studio_name>.git`，`prepare.py` 复制到克隆下来的目录后 `git add -A && git commit && git push`。
 
 ## 模型
 
@@ -104,6 +120,7 @@ skinsight/
 ├── pretrain.py             masked ingredient modeling 自监督预训练
 ├── baseline.py             词袋 + 逻辑回归 baseline（同划分、同指标）
 ├── predict.py              推理 + 注意力解释
+├── ocr.py                  拍照识别：OCR 文字排序、截取成分段、拼接断行
 └── cli.py                  命令行入口
 app.py                      网页 demo（Gradio）
 deploy/modelscope/          魔搭创空间部署文件
@@ -330,7 +347,7 @@ python -m skinsight.train --csv data/cosmetics.csv --task category --seed 1 --ep
 
 ## Roadmap
 
-- [ ] OCR：拍照识别成分表
+- [x] OCR：拍照识别成分表（RapidOCR，本地运行）
 - [ ] 根据肤质和所在城市的气候生成护肤流程
 - [x] Web Demo（Gradio，可部署到魔搭创空间）
 - [x] 扩充知识库（v0.2，377 个成分），中文名对接《已使用化妆品原料目录（2021年版）》

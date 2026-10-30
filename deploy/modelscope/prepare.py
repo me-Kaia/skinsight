@@ -2,7 +2,7 @@
 
     python deploy/modelscope/prepare.py <创空间仓库目录>
 
-只复制网页 demo 用到的部分：app.py、知识库和规则引擎（不含模型、训练代码和数据）。
+只复制网页 demo 用到的部分：app.py、知识库、规则引擎和 OCR 文字处理（不含肤质模型、训练代码和数据）。
 """
 from __future__ import annotations
 
@@ -17,9 +17,11 @@ FILES = {
     "LICENSE": ROOT / "LICENSE",
     "README.md": HERE / "README.md",
     "requirements.txt": HERE / "requirements.txt",
+    "packages.txt": HERE / "packages.txt",
     "skinsight/__init__.py": ROOT / "skinsight/__init__.py",
     "skinsight/kb.py": ROOT / "skinsight/kb.py",
     "skinsight/conflicts.py": ROOT / "skinsight/conflicts.py",
+    "skinsight/ocr.py": ROOT / "skinsight/ocr.py",
     "skinsight/data/ingredients.json": ROOT / "skinsight/data/ingredients.json",
 }
 

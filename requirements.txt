@@ -1,3 +1,4 @@
 torch>=2.0
 scikit-learn>=1.3   # 只有 baseline 需要
 gradio>=4.44,<6     # 只有网页 demo（app.py）需要
+rapidocr_onnxruntime==1.2.3   # 只有网页拍照识别需要

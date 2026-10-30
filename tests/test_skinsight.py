@@ -1,3 +1,5 @@
+import importlib.util
+import math
 import unittest
 
 from skinsight.conflicts import check_routine
@@ -158,9 +160,11 @@ class TestApp(unittest.TestCase):
 
     def test_analyze(self):
         import app
-        summary, rows = app.analyze("Water, Alcohol Denat., Ectoin, DMDM Hydantoin, Totally Unknown Thing")
+        summary, people, rows = app.analyze("Water, Alcohol Denat., Ectoin, DMDM Hydantoin, Totally Unknown Thing")
         self.assertIn("共 **5** 个成分，知识库识别 **4** 个", summary)
         self.assertIn("甲醛释放体", summary)
+        self.assertIn("**干皮、敏感肌**", people)
+        self.assertNotRegex(people, "适合|放心")
         self.assertEqual(rows[2][2], "依克多因（四氢甲基嘧啶羧酸）")
         self.assertIn("酒精", rows[1][4])
         self.assertEqual(rows[4][2], "（未收录）")
@@ -174,6 +178,59 @@ class TestApp(unittest.TestCase):
         self.assertIn("[高] A + 产品2", out)
         for ex in app.CHECK_EXAMPLES + [[e] for e in app.ANALYZE_EXAMPLES]:
             (app.check if len(ex) == 8 else app.analyze)(*ex)  # 示例都能跑通
+
+
+    def test_population_notes(self):
+        from skinsight.kb import population_notes
+        notes = dict(population_notes(kb.parse(
+            "Water, Retinol, Glycolic Acid, Ethylhexyl Palmitate, Linalool")))
+        self.assertIn("备孕、孕期、哺乳期", notes)
+        self.assertIn("屏障受损、医美术后", notes)
+        self.assertIn("易长闭口/痘痘者", notes)
+        self.assertIn("敏感肌", notes)
+        self.assertEqual(population_notes(kb.parse("水、甘油、透明质酸钠")), [])
+
+    @unittest.skipIf(importlib.util.find_spec("rapidocr_onnxruntime") is None, "未安装 rapidocr_onnxruntime")
+    def test_recognize_photo_deletes_upload(self):
+        import app
+        import cv2
+        import numpy as np
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "blank.png")
+            cv2.imwrite(p, np.full((60, 200, 3), 255, np.uint8))
+            text, status = app.recognize_photo(p, "水、甘油", append=True)
+            self.assertFalse(os.path.exists(p))  # 上传的图片不留在磁盘上
+        self.assertEqual(text, "水、甘油")
+        self.assertIn("没有识别到文字", status)
+
+
+class TestOCRText(unittest.TestCase):
+    """OCR 之后的文字处理（不需要 OCR 模型）。"""
+
+    def test_extract_and_join(self):
+        from skinsight.ocr import extract_ingredients
+        text, found = extract_ingredients(
+            ["产品名称：保湿精华", "全成分：水、甘油、丁二醇、烟酰", "胺、透明质酸钠", "1,2-己二醇、苯氧", "乙醇、香精",
+             "使用方法：取适量涂抹", "保质期：3年"], kb)
+        self.assertTrue(found)
+        self.assertEqual(text, "水、甘油、丁二醇、烟酰胺、透明质酸钠、1,2-己二醇、苯氧乙醇、香精")
+        text, _ = extract_ingredients(
+            ["INGREDIENTS:Water,ButyleneGlycol,PEG-", "100 Stearate, Caprylic/Capric Trigly-", "ceride, SodiumHydro",
+             "xide, Niacinamide", "Parfum.", "Directions: Apply to face."], kb)
+        self.assertEqual(text, "Water, Butylene Glycol, PEG-100 Stearate, Caprylic/Capric Triglyceride, "
+                               "Sodium Hydroxide, Niacinamide, Parfum")
+        text, found = extract_ingredients(["透明质酸钠、1", "2-己二醇"], kb)
+        self.assertFalse(found)
+        self.assertEqual(text, "透明质酸钠、1,2-己二醇")
+
+    def test_lines_from_tilted_boxes(self):
+        from skinsight.ocr import lines_from_ocr
+        # 倾斜约 5°：每行被切成左右两个框；第二行左框的 y 比第一行右框还小，不能按原始 y 排序
+        s = math.tan(math.radians(5))
+        def box(x, y, w=200, h=20):
+            return [[x, y + x * s], [x + w, y + (x + w) * s], [x + w, y + h + (x + w) * s], [x, y + h + x * s]]
+        result = [[box(0, 0), "A1", 0.9], [box(400, 0), "A2", 0.9], [box(0, 30), "B1", 0.9], [box(400, 30), "B2", 0.9]]
+        self.assertEqual(lines_from_ocr(result), ["A1 A2", "B1 B2"])
 
 
 @unittest.skipIf(torch is None, "未安装 torch")

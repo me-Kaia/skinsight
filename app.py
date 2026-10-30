@@ -1,14 +1,19 @@
-"""skinsight 网页 demo（Gradio）：成分解读 + 叠用检查。
+"""skinsight 网页 demo（Gradio）：成分解读（可拍照识别）+ 叠用检查。
 
     python app.py            # 本地启动，默认 http://127.0.0.1:7860
 
-只用知识库和规则，不加载肤质预测模型，也不需要 torch。
+只用知识库和规则，不加载肤质预测模型，也不需要 torch。拍照识别用本地 OCR（RapidOCR），
+上传的图片只在内存里处理，识别后立即删除 Gradio 的上传缓存文件。
 部署到魔搭创空间见 deploy/modelscope/。
 """
 from __future__ import annotations
 
+import os
+import re
+
 from skinsight.conflicts import LEVEL_ZH, check_routine
-from skinsight.kb import KnowledgeBase, ingredient_hints, summarize_flags, user_note
+from skinsight.kb import (POPULATION_FOOTNOTE, KnowledgeBase, ingredient_hints, population_notes, summarize_flags,
+                          user_note)
 
 KB = KnowledgeBase()
 
@@ -47,11 +52,63 @@ CHECK_EXAMPLES = [
 ]
 
 
-def analyze(text: str) -> tuple[str, list[list]]:
-    """成分表 -> (Markdown 摘要, 逐成分表格行)。"""
+PHOTO_TIPS = ("**拍照提示**：把包装放平或捏平，对准焦距，避开灯光反光，尽量只拍成分表那一块。"
+              "瓶身是圆的时，让文字行保持水平、正对中间拍；成分表较长可以转动瓶子分段拍，勾选「追加到已有文本」逐段识别。"
+              "识别结果会填进下面的文本框，请核对、改正后再点「分析」。")
+
+
+def recognize_photo(path: str | None, current: str = "", append: bool = False) -> tuple[str, str]:
+    """上传的照片 -> (成分表文本, 状态说明)。图片读进内存后立即删除上传缓存文件。
+
+    append=True 时把识别结果接在 current 后面（瓶身弯曲时分段拍照用）。
+    """
+    if not path:
+        return current, "请先上传一张成分表照片。"
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.remove(path)  # 不保存用户图片
+        except OSError:
+            pass
+    try:
+        from skinsight.ocr import extract_ingredients, image_from_bytes, recognize
+        lines = recognize(image_from_bytes(data))
+    except ImportError:
+        return current, "当前环境没有安装 OCR（rapidocr_onnxruntime），请直接粘贴成分表文字。"
+    except ValueError as e:
+        return current, str(e)
+    if not lines:
+        return current, "没有识别到文字，请换一张更清晰、正对成分表的照片。"
+    text, found = extract_ingredients(lines, KB)
+    if found:
+        status = f"识别到 {len(lines)} 行文字，已截取「成分」后面的部分。OCR 可能认错字，请核对后点「分析」。"
+    else:
+        status = (f"识别到 {len(lines)} 行文字，但没找到「成分 / 全成分 / Ingredients」标题，已填入全部文字，"
+                  "请删掉成分表以外的内容后再点「分析」。")
+    if append and current.strip():
+        sep = "、" if re.search(r"[一-鿿]", current[-1:] + text[:1]) else ", "
+        text = current.rstrip(" ,，、") + sep + text
+    unknown = [it.raw for it in KB.parse(text) if not it.ingredient]
+    if unknown:
+        status += f"其中 {len(unknown)} 个成分知识库没认出来，可能是 OCR 认错了字，请重点核对。"
+    return text, status
+
+
+def population_md(items) -> str:
+    """「需注意人群」板块。"""
+    notes = population_notes(items)
+    lines = ["**需注意人群**", ""]
+    lines += [f"- **{who}**：{msg}" for who, msg in notes] or ["没有触发需要特别留意的规则。"]
+    return "\n".join(lines + ["", POPULATION_FOOTNOTE])
+
+
+def analyze(text: str) -> tuple[str, str, list[list]]:
+    """成分表 -> (Markdown 摘要, 需注意人群, 逐成分表格行)。"""
     items = KB.parse(text or "")
     if not items:
-        return "请先粘贴一个成分表（中文或英文 INCI，用逗号、顿号或换行分隔）。", []
+        return "请先粘贴一个成分表（中文或英文 INCI，用逗号、顿号或换行分隔），或上传成分表照片。", "", []
     known = sum(1 for it in items if it.ingredient)
     lines = [f"共 **{len(items)}** 个成分，知识库识别 **{known}** 个。"]
     flags = summarize_flags(items)
@@ -70,7 +127,7 @@ def analyze(text: str) -> tuple[str, list[list]]:
         hints = "、".join(ingredient_hints(ing))
         note = user_note(ing)
         rows.append([it.position + 1, it.raw, name, func, "；".join(x for x in (hints, note) if x)])
-    return "\n".join(lines), rows
+    return "\n".join(lines), population_md(items), rows
 
 
 def check(*fields: str) -> str:
@@ -97,18 +154,30 @@ def check(*fields: str) -> str:
 def build_demo():
     import gradio as gr
 
-    with gr.Blocks(title="skinsight 成分解读") as demo:
+    # delete_cache：万一有上传文件没被删掉，也每 10 分钟清理一次
+    with gr.Blocks(title="skinsight 成分解读", delete_cache=(600, 600)) as demo:
         gr.Markdown("# skinsight 护肤品成分解读\n粘贴成分表（中文或英文 INCI 都可以），查看每个成分的作用和需要留意的地方，"
                     "或者检查几个产品一起用会不会冲突。")
         with gr.Tab("成分解读"):
-            text = gr.Textbox(label="成分表", lines=5, placeholder="例如：水、甘油、烟酰胺、香精……")
-            btn = gr.Button("解读", variant="primary")
+            with gr.Accordion("拍照识别成分表（可选）", open=True):
+                gr.Markdown(PHOTO_TIPS)
+                photo = gr.Image(label="成分表照片", type="filepath", sources=["upload", "webcam"], height=280)
+                with gr.Row():
+                    ocr_btn = gr.Button("识别图片文字")
+                    append = gr.Checkbox(label="追加到已有文本（分段拍照时用）", value=False)
+                ocr_status = gr.Markdown()
+            text = gr.Textbox(label="成分表（可编辑）", lines=5, placeholder="例如：水、甘油、烟酰胺、香精……")
+            btn = gr.Button("分析", variant="primary")
             summary = gr.Markdown()
+            people = gr.Markdown()
             table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["number", "str", "str", "str", "str"],
                                  interactive=False, wrap=True)
             gr.Examples(ANALYZE_EXAMPLES, inputs=text, label="示例")
-            btn.click(analyze, inputs=text, outputs=[summary, table])
-            text.submit(analyze, inputs=text, outputs=[summary, table])
+            # 识别后清空图片组件：上传缓存文件已删除，不再显示
+            ocr_btn.click(recognize_photo, inputs=[photo, text, append], outputs=[text, ocr_status]).then(
+                lambda: None, outputs=photo)
+            btn.click(analyze, inputs=text, outputs=[summary, people, table])
+            text.submit(analyze, inputs=text, outputs=[summary, people, table])
         with gr.Tab("叠用检查"):
             gr.Markdown("填写 2–4 个准备一起用的产品（同一天早晚叠用或同一次叠涂），成分表留空的产品不参与检查。")
             fields = []

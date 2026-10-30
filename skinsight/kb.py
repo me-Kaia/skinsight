@@ -210,3 +210,34 @@ def summarize_flags(items: list[ParsedItem]) -> list[tuple[str, str]]:
     if found:
         flags.append(("note", "主要活性成分：" + "、".join(found)))
     return flags
+
+
+POPULATION_FOOTNOTE = "以上只是根据成分做的一般提示，不是针对个人或肤质的判断；有皮肤问题或特殊情况，建议咨询医生。"
+
+
+def population_notes(items: list[ParsedItem]) -> list[tuple[str, str]]:
+    """基于知识库规则的「需注意人群」提示，返回 [(人群, 说明)]。不做肤质预测，只给留意/慎用类提示。"""
+    known = [it.ingredient for it in items if it.ingredient]
+    names = lambda ings: "、".join(dict.fromkeys(i.display for i in ings))
+    has = lambda *tags: [i for i in known if set(tags) & set(i.tags)]
+    notes = []
+
+    frag = has("fragrance", "fragrance_allergen")
+    if frag:
+        notes.append(("敏感肌", f"含香精/香料致敏原（{names(frag)}），慎用；初次使用可先在耳后或手臂内侧少量试用。"))
+    fr = has("formaldehyde_releaser")
+    if fr:
+        notes.append(("敏感肌", f"含甲醛释放体防腐剂（{names(fr)}），慎用。"))
+    alc = [it for it in items if it.ingredient and "drying_alcohol" in it.ingredient.tags and it.position < 5]
+    if alc:
+        notes.append(("干皮、敏感肌", f"酒精排在第 {alc[0].position + 1} 位，含量可能较高，留意使用后是否干燥、刺痛。"))
+    com = [i for i in known if i.comedogenic >= 4]
+    if com:
+        notes.append(("易长闭口/痘痘者", f"含致痘评分较高的成分（{names(com)}），留意使用后是否长闭口（评分来自早期动物实验，仅供参考）。"))
+    ret = has("retinoid")
+    if ret:
+        notes.append(("备孕、孕期、哺乳期", f"含维A类（{names(ret)}），一般建议避免使用，使用前请咨询医生。"))
+    strong = has("aha", "bha", "pha", "vitamin_c_pure") + [i for i in known if i.irritation >= 3]
+    if strong:
+        notes.append(("屏障受损、医美术后", f"含酸类/纯VC/高刺激成分（{names(strong)}），慎用；术后护理请遵医嘱。"))
+    return notes
