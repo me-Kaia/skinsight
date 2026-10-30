@@ -89,6 +89,10 @@ class KnowledgeBase:
                 if k in self.index and self.index[k] != ing.id:
                     raise ValueError(f"别名冲突: {key!r} -> {self.index[k]} / {ing.id}")
                 self.index[k] = ing.id
+        # 标准名带拉丁名括号的，只写中文部分也能查到：「牛油果树（BUTYROSPERMUM PARKII）果脂」->「牛油果树果脂」
+        for ing in self.items.values():
+            if PAREN_RE.search(ing.zh):
+                self.index.setdefault(normalize(PAREN_RE.sub("", ing.zh)), ing.id)
         self._keys = list(self.index)
         # 去掉空格和标点后的写法 -> id；两个成分撞车时不用（记为 None）
         self._compact: dict[str, Optional[str]] = {}
@@ -136,9 +140,17 @@ class KnowledgeBase:
     def parse(self, text: str) -> list[ParsedItem]:
         parts = [p for p in SPLIT_RE.split(text) if normalize(p)]
         out = []
-        for pos, raw in enumerate(parts):
+        for raw in parts:
             ing, how = self.lookup(raw)
-            out.append(ParsedItem(raw=raw.strip(), position=pos, ingredient=ing, match=how))
+            pieces = [p for p in raw.split("/") if normalize(p)]
+            if ing is None and len(pieces) > 1:
+                # 「神经酰胺 NS/神经酰胺 NG」：整体查不到、但每一部分都认识，按多个成分处理
+                hits = [self.lookup(p) for p in pieces]
+                if all(i for i, _ in hits):
+                    for p, (i, h) in zip(pieces, hits):
+                        out.append(ParsedItem(raw=p.strip(), position=len(out), ingredient=i, match=h))
+                    continue
+            out.append(ParsedItem(raw=raw.strip(), position=len(out), ingredient=ing, match=how))
         return out
 
 

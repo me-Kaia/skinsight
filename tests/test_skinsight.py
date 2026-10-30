@@ -160,16 +160,28 @@ class TestApp(unittest.TestCase):
 
     def test_analyze(self):
         import app
-        summary, people, rows = app.analyze("Water, Alcohol Denat., Ectoin, DMDM Hydantoin, Totally Unknown Thing")
-        self.assertIn("共 **5** 个成分，知识库识别 **4** 个", summary)
+        summary, people, marked, rows, sugg = app.analyze(
+            "Water, Alcohol Denat., Ectoin, DMDM Hydantoin, 油酸, 胆笛醇, Totally Unknown Thing")
+        self.assertIn("知识库已解读 **4** 个，原料目录登记但暂无解读 **1** 个，未识别 **2** 个", summary)
         self.assertIn("甲醛释放体", summary)
         self.assertIn("**干皮、敏感肌**", people)
         self.assertNotRegex(people, "适合|放心")
         self.assertEqual(rows[2][2], "依克多因（四氢甲基嘧啶羧酸）")
         self.assertIn("酒精", rows[1][4])
-        self.assertEqual(rows[4][2], "（未收录）")
+        self.assertEqual(rows[4][4], "已确认是登记原料，暂无详细解读")  # 油酸：知识库没有，目录里有
+        self.assertIn("胆甾醇", rows[5][4])                              # 疑似错字给出候选
+        self.assertEqual(rows[6][2], "⚠️ 未识别")
         self.assertEqual(len(rows[0]), len(app.TABLE_HEADERS))
+        labels = [lab for _, lab in marked if lab]
+        self.assertEqual(labels, ["登记原料，暂无解读", "未识别", "未识别"])
+        self.assertIn("胆笛醇 → 胆甾醇", sugg)
         self.assertIn("请先粘贴", app.analyze("  ")[0])
+
+    def test_apply_suggestions_only_what_user_chose(self):
+        import app
+        text = "水、胆笛醇、工二醇"
+        self.assertEqual(app.apply_suggestions(text, []), text)  # 不勾选就不替换
+        self.assertEqual(app.apply_suggestions(text, ["胆笛醇 → 胆甾醇", "胆笛醇 → 胆固醇"]), "水、胆甾醇、工二醇")
 
     def test_check(self):
         import app
@@ -231,6 +243,91 @@ class TestOCRText(unittest.TestCase):
             return [[x, y + x * s], [x + w, y + (x + w) * s], [x + w, y + h + (x + w) * s], [x, y + h + x * s]]
         result = [[box(0, 0), "A1", 0.9], [box(400, 0), "A2", 0.9], [box(0, 30), "B1", 0.9], [box(400, 30), "B2", 0.9]]
         self.assertEqual(lines_from_ocr(result), ["A1 A2", "B1 B2"])
+
+
+class TestScreenshotRegression(unittest.TestCase):
+    """两张电商详情页截图的回归测试。
+
+    tests/fixtures/ocr_*.json 是 RapidOCR 对截图的原始输出（文字框坐标 + 文字），测试不需要图片和 OCR 模型。
+    图片本身有版权，不放进仓库；本地有 data/ocr_samples/*.jpg 时 test_real_ocr 会从图片重新跑一遍。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from skinsight.iecic import Catalog
+        cls.catalog = Catalog()
+
+    def extract(self, name, result=None):
+        import json
+        from skinsight.ocr import extract_ingredients, lines_from_ocr
+        if result is None:
+            path = os.path.join(os.path.dirname(__file__), "fixtures", f"ocr_{name}.json")
+            with open(path, encoding="utf-8") as f:
+                result = json.load(f)
+        text, found = extract_ingredients(lines_from_ocr(result), kb, self.catalog)
+        self.assertTrue(found)
+        return text
+
+    def check_augustinus(self, text):
+        # 左边瓶身上的品牌名、AB 标志不能混进成分表
+        self.assertNotRegex(text, "Augustinus|Bader|NB|AB")
+        self.assertNotIn("微量成分", text)  # 小标题当分隔符
+        self.assertTrue(text.startswith("水、辛酸/"))
+        self.assertTrue(text.endswith("水蒜芥（SISYMBRIUM IRIO）籽油、寡肽-4"))
+        for name in ["牛油果树（BUTYROSPERMUM PARKII）果脂", "向日葵（HELIANTHUS ANNUUS）籽油、乙醇",
+                     "视黄醇棕榈酸酯", "棕榈酸、神经酰胺"]:
+            self.assertIn(name, text)
+        items = kb.parse(text)
+        self.assertEqual(len(items), 46)
+        self.assertIn("retinyl_palmitate", {it.ingredient.id for it in items if it.ingredient})
+        from skinsight.kb import population_notes
+        self.assertIn("视黄醇棕榈酸酯", dict(population_notes(items))["备孕、孕期、哺乳期"])
+        # 知识库和原料目录都对不上的只剩 OCR 认错的「胆笛醇」（胆甾醇）
+        unknown = [it.raw for it in items if not it.ingredient and not self.catalog.lookup(it.raw)]
+        self.assertEqual(unknown, ["胆笛醇"])
+        self.assertEqual(self.catalog.suggest("胆笛醇", kb=kb)[0], "胆甾醇")
+
+    def test_augustinus_bader(self):
+        self.check_augustinus(self.extract("augustinus_bader"))
+
+    def test_curel_mask(self):
+        text = self.extract("curel_mask")
+        # 左边红色标注「净含量」不能截断成分表；「。」「.」认错的逗号按分隔符处理
+        self.assertNotIn("净含量", text)
+        self.assertTrue(text.startswith("水、甘油、"))
+        self.assertTrue(text.endswith("EDTA二钠、精氨酸、羟丙基甲基纤维素、蓝桉叶提取物"))
+        sugg = self.catalog.suggest("甘草酸二钾丙烯酸（酯）类/C10-30烷醇丙烯酸酯交联聚合物", kb=kb)
+        self.assertTrue(sugg[0].startswith("甘草酸二钾、丙烯酸（酯）类"))  # 漏掉的逗号：给出拆分建议
+
+    @unittest.skipUnless(os.path.exists(os.path.join(os.path.dirname(__file__), "..", "data", "ocr_samples",
+                                                     "augustinus_bader.jpg"))
+                         and importlib.util.find_spec("rapidocr_onnxruntime"), "没有本地截图或 OCR")
+    def test_real_ocr(self):
+        from skinsight.ocr import image_from_bytes, _ENGINE  # noqa: F401
+        from rapidocr_onnxruntime import RapidOCR
+        path = os.path.join(os.path.dirname(__file__), "..", "data", "ocr_samples", "augustinus_bader.jpg")
+        with open(path, "rb") as f:
+            result, _ = RapidOCR()(image_from_bytes(f.read()))
+        self.check_augustinus(self.extract("augustinus_bader", result))
+
+
+class TestCatalog(unittest.TestCase):
+    def test_lookup_and_suggest(self):
+        from skinsight.iecic import Catalog
+        c = Catalog()
+        self.assertGreater(len(c), 8000)
+        self.assertEqual(c.lookup("野大豆（GLYCINESOJA）蛋白").no, 7609)    # 括号里拉丁名少了空格
+        self.assertEqual(c.lookup("牛油果树果脂").no, 4891)                  # 只写中文部分
+        self.assertEqual(c.lookup("OLEIC ACID").zh, "油酸")
+        self.assertIsNone(c.lookup("完全不存在的成分"))
+        self.assertIn("氢氧化钠", c.suggest("氧氧化钠", kb=kb))
+
+    def test_kb_chinese_only_and_slash_mixture(self):
+        self.assertEqual(kb.lookup("牛油果树果脂")[0].id, "shea_butter")
+        self.assertEqual(kb.lookup("牛油果树（BUTYROSPERMUMPARKII）果脂")[0].id, "shea_butter")
+        ids = [it.ingredient.id for it in kb.parse("神经酰胺 NS/神经酰胺NG、甘油")]
+        self.assertEqual(ids, ["ceramide_ns", "ceramide_ng", "glycerin"])
+        self.assertEqual(kb.lookup("Caprylic/Capric Triglyceride")[0].id, "caprylic_capric_tg")  # 本身带斜杠的不拆
 
 
 @unittest.skipIf(torch is None, "未安装 torch")

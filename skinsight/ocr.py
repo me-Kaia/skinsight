@@ -8,10 +8,13 @@ from __future__ import annotations
 import math
 import re
 
-from .kb import COMMA_RE
+from .kb import COMMA_RE, normalize
 
-# 成分段开头：「全成分：」「成分：」「配料」「Ingredients:」「INCI:」……
-HEADER_RE = re.compile(r"(全成分(?:表)?|成分表|产品成分|成分|配料|ingredients?|inci)\s*[:：]?", re.I)
+# 成分段开头：「全成分：」「成分：」「配料」「Ingredients:」「INCI:」……（「其他微量成分：」不算）
+HEADER_RE = re.compile(
+    r"(全成分(?:表)?|成分表|产品成分|(?<!微量)(?<!其他)(?<!其它)(?<!次要)成分|配料|ingredients?|inci)\s*[:：]?", re.I)
+# 成分表中间的小标题，当作分隔符
+SUBHEAD_RE = re.compile(r"(?:其他|其它)?(?:微量|次要)成分\s*[:：]?|(?:其他|其它)成分\s*[:：]")
 # 成分段之后常见的其他栏目，遇到就截断
 STOP_RE = re.compile(
     r"(使用方法|用法|使用说明|注意事项|警示|警告|保质期|限期使用日期|生产日期|生产批号|批号|净含量|规格|执行标准|"
@@ -22,13 +25,52 @@ STOP_RE = re.compile(
 CJK_RE = re.compile(r"[一-鿿]")
 SEP_END = ("，", ",", "、", ";", "；", "/", "(", "（")
 SEP_RE = re.compile(COMMA_RE + r"|[，、;；]")  # 与 kb.SPLIT_RE 一致：1,2-己二醇 的逗号不算分隔符
+_compact = lambda s: re.sub(r"[\s/.,\-]+", "", normalize(s))
 
 
-def lines_from_ocr(result) -> list[str]:
+def _is_header(text: str) -> bool:
+    m = HEADER_RE.search(text)
+    return bool(m) and (m.group(0).rstrip().endswith((":", "：")) or m.start() == 0)
+
+
+def _rows(items):
+    """items: [(y, x_left, x_right, h, text)] -> 按竖直位置聚类成行 [[y, h, [item, ...]], ...]。"""
+    rows: list[list] = []
+    for it in sorted(items):
+        y, h = it[0], it[3]
+        if rows and abs(y - rows[-1][0]) < 0.5 * max(h, rows[-1][1]):
+            rows[-1][2].append(it)
+        else:
+            rows.append([y, h, [it]])
+    return rows
+
+
+def _same_column(items):
+    """只保留和「成分」标题在同一列的文字框（横向重叠至少一半），丢掉左右两侧的瓶身、图片里的字。
+
+    标题和后面的文字可能分在两个框里（「成分:」单独一格），把同一行紧挨着的框一起算进列宽。
+    找不到标题时原样返回。
+    """
+    for _y, h, parts in _rows(items):
+        parts = sorted(parts, key=lambda it: it[1])
+        for k, (_, left, right, _, text) in enumerate(parts):
+            if not _is_header(text):
+                continue
+            for _, ql, qr, _, _ in parts[k + 1:]:
+                if ql - right > 2 * h:
+                    break
+                right = qr
+            lo, hi = left - 0.5 * h, right + 0.5 * h
+            return [it for it in items if min(it[2], hi) - max(it[1], lo) >= 0.5 * (it[2] - it[1])]
+    return items
+
+
+def lines_from_ocr(result, column: bool = True) -> list[str]:
     """RapidOCR 的 [[box, text, score], ...] -> 按阅读顺序排好的文本行。
 
-    照片常常是斜的：先用长文本框的上边沿估计整体倾角，把框中心旋转回水平，
+    照片常常是斜的：先用长文本框的上边沿估计整体倾角，把框旋转回水平，
     再按竖直位置聚类成行（同一行可能被切成多个框），行内按横坐标排序。
+    column=True 时先做版面分栏，只保留「成分」标题所在的那一列（见 _same_column）。
     """
     boxes = [(box, text.strip()) for box, text, _score in result or [] if text.strip()]
     if not boxes:
@@ -41,22 +83,17 @@ def lines_from_ocr(result) -> list[str]:
     skew = sorted(angles)[len(angles) // 2] if angles else 0.0
     cos, sin = math.cos(skew), math.sin(skew)
     items = []
-    for (tl, tr, br, bl), text in boxes:
-        cx, cy = (tl[0] + br[0]) / 2, (tl[1] + br[1]) / 2
-        items.append((-cx * sin + cy * cos, cx * cos + cy * sin, math.dist(tl, bl), text))
-    items.sort()
-    rows: list[list] = []
-    for y, x, h, text in items:
-        if rows and abs(y - rows[-1][0]) < 0.5 * max(h, rows[-1][1]):
-            rows[-1][2].append((x, text))
-        else:
-            rows.append([y, h, [(x, text)]])
+    for box, text in boxes:
+        xs = [px * cos + py * sin for px, py in box]
+        ys = [-px * sin + py * cos for px, py in box]
+        items.append((sum(ys) / 4, min(xs), max(xs), math.dist(box[0], box[3]), text))
+    if column:
+        items = _same_column(items)
     out = []
-    for _y, _h, parts in rows:
-        parts.sort()
+    for _y, _h, parts in _rows(items):
         line = ""
-        for _x, text in parts:
-            line = _join(line, text, same_line=True)
+        for it in sorted(parts, key=lambda it: it[1]):
+            line = _join(line, it[4], same_line=True)
         out.append(line)
     return out
 
@@ -74,8 +111,9 @@ def _join(a: str, b: str, same_line: bool = False, kb=None) -> str:
     if a.endswith(SEP_END) or b.startswith((")", "）", "，", ",", "、", ";", "；")):
         return a + b
     if a.endswith("-") and not same_line:
-        # "Trigly-" + "ceride" 是断词，去掉连字符；"PEG-" + "100 Stearate" 保留
-        return a[:-1] + b if b[0].islower() else a + b
+        # 字母之间的连字符是排版断词（"Trigly-" + "ceride"、"（BUTYROSPE-" + "RMUM PARKII）"），去掉；
+        # "PEG-" + "100 Stearate" 保留
+        return a[:-1] + b if len(a) > 1 and a[-2].isalpha() and b[0].isalpha() else a + b
     if not same_line and re.search(r"\d$", a) and re.match(r"\d+-", b):
         return a + "," + b  # "1" + "2-己二醇"：行尾的逗号没识别出来
     cjk = bool(CJK_RE.match(a[-1]) or CJK_RE.match(b[0]))
@@ -90,25 +128,41 @@ def _join(a: str, b: str, same_line: bool = False, kb=None) -> str:
     return a + glue + b
 
 
-def _restore_spaces(text: str, kb) -> str:
-    """OCR 常把英文成分名的空格丢掉（"ButyleneGlycol"）：只差空格/标点就能对上知识库的，换回标准 INCI 写法。"""
+def _restore_spaces(text: str, kb, catalog=None) -> str:
+    """OCR 常把成分名里的空格丢掉：英文名（"ButyleneGlycol"）、中文名括号里的拉丁名（"牛油果树（BUTYROSPERMUMPARKII）果脂"）。
+
+    只差空格/标点就能对上知识库或原料目录的，换回标准写法；有别的字不一样的不改（那是疑似错字，交给用户确认）。
+    """
+    same = lambda a, b: _compact(a) == _compact(b)
+
     def fix(seg: str) -> str:
         s = seg.strip()
-        if not s or " " in s or CJK_RE.search(s) or len(s) < 8:
+        if not s:
+            return seg
+        if CJK_RE.search(s):
+            if not re.search(r"[(（][^)）]*[A-Za-z]{4}", s):
+                return seg
+            ing, how = kb.lookup(s)
+            if ing and how in ("exact", "paren") and same(s, ing.zh):
+                return seg.replace(s, ing.zh)
+            entry = catalog.lookup(s) if catalog is not None else None
+            return seg.replace(s, entry.zh) if entry and same(s, entry.zh) else seg
+        if " " in s or len(s) < 8:
             return seg
         ing, how = kb.lookup(s)
-        if ing and how == "exact" and re.sub(r"[\s/.,\-]+", "", ing.inci.lower()) == re.sub(r"[\s/.,\-]+", "", s.lower()):
+        if ing and how == "exact" and same(s, ing.inci):
             return seg.replace(s, ing.inci)
         return seg
-    parts = re.split(f"({COMMA_RE})", text)
-    return "".join(p if re.fullmatch(COMMA_RE, p or "") else fix(p) for p in parts)
+    parts = re.split(f"({SEP_RE.pattern})", text)
+    return "".join(p if SEP_RE.fullmatch(p or "") else fix(p) for p in parts)
 
 
-def extract_ingredients(lines: list[str], kb=None) -> tuple[str, bool]:
+def extract_ingredients(lines: list[str], kb=None, catalog=None) -> tuple[str, bool]:
     """从 OCR 文本行里截出成分表。返回 (成分表文本, 是否找到了「成分」标题)。
 
     找到标题时取标题之后、下一个栏目（使用方法、保质期、Directions……）之前的内容；
-    没找到时返回全部文字，交给用户在文本框里删改。断开的成分名按 _join 的规则拼回去。
+    没找到时返回全部文字，交给用户在文本框里删改。断开的成分名按 _join 的规则拼回去，
+    「其他微量成分：」这类小标题换成分隔符。
     """
     text_lines = [l.strip() for l in lines if l.strip()]
     start, found = 0, False
@@ -128,12 +182,14 @@ def extract_ingredients(lines: list[str], kb=None) -> tuple[str, bool]:
         body.append(line)
     text = ""
     for line in body:
-        text = _join(text, line.strip(), kb=kb)
+        text = _join(text, SUBHEAD_RE.sub("、", line).strip(), kb=kb)
+    text = re.sub(r"[、，,]\s*[、，,]", "、", text)  # 小标题前后本来就有分隔符时去重
+    text = re.sub(r"(?<=[一-鿿）)])\s*[.。]\s*(?=\S)", "、", text)  # 中文后面的句点多半是认错的逗号
     text = re.sub(r"\s*([，、;；])\s*", r"\1", text)          # 中文分隔符前后不留空格
     text = re.sub(r"\s*,\s*(?!\d)|(?<!\d)\s*,\s*", ", ", text)  # 英文逗号后统一一个空格（1,2-己二醇 不动）
     text = re.sub(r"\s{2,}", " ", text).strip(" .。;；,，")
     if kb is not None:
-        text = _restore_spaces(text, kb)
+        text = _restore_spaces(text, kb, catalog)
     return text, found
 
 
