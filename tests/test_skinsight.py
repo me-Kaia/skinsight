@@ -153,6 +153,29 @@ class TestClean(unittest.TestCase):
         self.assertEqual(clean_ingredients("水、甘油、1,2-己二醇，香精"), "水、甘油、1,2-己二醇，香精")
 
 
+class TestApp(unittest.TestCase):
+    """网页 demo 的逻辑部分（不需要 gradio）。"""
+
+    def test_analyze(self):
+        import app
+        summary, rows = app.analyze("Water, Alcohol Denat., Ectoin, DMDM Hydantoin, Totally Unknown Thing")
+        self.assertIn("共 **5** 个成分，知识库识别 **4** 个", summary)
+        self.assertIn("甲醛释放体", summary)
+        self.assertEqual(rows[2][2], "依克多因（四氢甲基嘧啶羧酸）")
+        self.assertIn("酒精", rows[1][4])
+        self.assertEqual(rows[4][2], "（未收录）")
+        self.assertEqual(len(rows[0]), len(app.TABLE_HEADERS))
+        self.assertIn("请先粘贴", app.analyze("  ")[0])
+
+    def test_check(self):
+        import app
+        self.assertIn("至少填写 2 个", app.check("A", "水, 视黄醇", "", "", "", "", "", ""))
+        out = app.check("A", "水, 视黄醇", "", "水, 水杨酸", "", "", "", "")
+        self.assertIn("[高] A + 产品2", out)
+        for ex in app.CHECK_EXAMPLES + [[e] for e in app.ANALYZE_EXAMPLES]:
+            (app.check if len(ex) == 8 else app.analyze)(*ex)  # 示例都能跑通
+
+
 @unittest.skipIf(torch is None, "未安装 torch")
 class TestModel(unittest.TestCase):
     def test_forward_and_training_step(self):

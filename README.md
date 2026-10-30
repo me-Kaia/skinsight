@@ -29,6 +29,35 @@ python -m skinsight.baseline --synthetic          # 词袋 + 逻辑回归对比�
 python -m skinsight analyze "Water, Glycerin, Fragrance, Coconut Oil" --ckpt checkpoints/skin_type.pt
 ```
 
+## 网页 Demo
+
+用 Gradio 做的中文网页，两个标签页：「成分解读」（逐个成分的名称、作用和提示）和「叠用检查」（2–4 个产品的冲突和建议）。只用知识库和规则，不展示肤质预测，也不需要 torch。
+
+```bash
+pip install "gradio>=4.44,<6"
+python app.py        # 打开 http://127.0.0.1:7860
+```
+
+如果开着系统代理（Clash 等）时启动报 `startup-events failed (code 502)`，先设置 `NO_PROXY=localhost,127.0.0.1` 再启动。
+
+### 部署到魔搭创空间（ModelScope）
+
+`deploy/modelscope/` 里是创空间需要的卡片 `README.md`（YAML 头指定入口 `app.py`）和 `requirements.txt`，`prepare.py` 负责把 demo 用到的文件（`app.py`、知识库、规则引擎，不含模型和训练代码）复制到创空间仓库：
+
+1. 在 [魔搭社区](https://www.modelscope.cn/) 登录后「创建创空间」，接入 SDK 选 **Gradio**，云资源选免费 CPU 即可，镜像用默认的最新版本；
+2. 在「个人中心 → 访问令牌」拿到 token，克隆创空间仓库并复制文件：
+
+```bash
+git clone http://oauth2:<your_access_token>@www.modelscope.cn/studios/<your_name>/<studio_name>.git
+python deploy/modelscope/prepare.py <studio_name>
+cd <studio_name>
+git add -A
+git commit -m "Add skinsight demo"
+git push
+```
+
+3. 在创空间页面点「立即发布」（或设置页的「上线」），等部署完成。之后更新代码重新执行第 2 步，再点设置页的「重启创空间」。
+
 ## 模型
 
 ```
@@ -76,6 +105,8 @@ skinsight/
 ├── baseline.py             词袋 + 逻辑回归 baseline（同划分、同指标）
 ├── predict.py              推理 + 注意力解释
 └── cli.py                  命令行入口
+app.py                      网页 demo（Gradio）
+deploy/modelscope/          魔搭创空间部署文件
 tests/                      单元测试：python -m unittest discover -s tests
 ```
 
@@ -301,8 +332,8 @@ python -m skinsight.train --csv data/cosmetics.csv --task category --seed 1 --ep
 
 - [ ] OCR：拍照识别成分表
 - [ ] 根据肤质和所在城市的气候生成护肤流程
-- [ ] Web Demo（Gradio）
-- [ ] 扩充知识库，对接《已使用化妆品原料目录》
+- [x] Web Demo（Gradio，可部署到魔搭创空间）
+- [x] 扩充知识库（v0.2，377 个成分），中文名对接《已使用化妆品原料目录（2021年版）》
 
 ## 免责声明
 
